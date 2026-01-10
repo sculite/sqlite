@@ -6599,7 +6599,42 @@ static SQLITE_NOINLINE void whereReverseScanOrder(WhereInfo *pWInfo){
 ** information needed to terminate the loop.  Later, the calling routine
 ** should invoke sqlite3WhereEnd() with the return value of this function
 ** in order to complete the WHERE clause processing.
-**
+*/
+
+#ifdef SQLITE_ENABLE_GPU_SCAN
+/*
+** Conservative check used by the planner to decide whether a sequential
+** scan of this WHERE clause is eligible for GPU delegatio.  This
+** intentionally errs and for now works onlyfor  very simple single-
+** table, deterministic, non-virtual scans will be appropraite for now.
+*/
+static int sqlite3IsGPUEligible(WhereInfo *pWInfo){
+  WhereClause *pWC;
+  int i;
+  if( pWInfo==0 ) return 0;
+  /* Only consider single-table plans for nkw */
+  if( pWInfo->nLevel!=1 ) return 0;
+  if( pWInfo->pTabList==0 ) return 0;
+  /* Reject virtual tables */
+  if( IsVirtual(pWInfo->pTabList->a[0].pSTab) ) return 0;
+  pWC = &pWInfo->sWC;
+  /* No OR terms either */
+  if( pWC->hasOr ) return 0;
+  for(i=0; i<pWC->nTerm; i++){
+    WhereTerm *pTerm = &pWC->a[i];
+    if( pTerm->pExpr==0 ) return 0;
+    /* reject virtual/code-generated terms or terms with sub-selects */
+    if( (pTerm->wtFlags & (TERM_VIRTUAL|TERM_VARSELECT))!=0 ) return 0;
+    /* reject terms that reference more than one table  */
+    if( pTerm->prereqAll && (pTerm->prereqAll & (pTerm->prereqAll-1)) ) return 0;
+    /* reject non-deterministic expressions */
+    if( !exprIsDeterministic(pTerm->pExpr) ) return 0;
+  }
+  // printf("GPU Scan eligible\n"); 
+  return 1;
+}
+#endif
+/*
 ** If an error occurs, this routine returns NULL.
 **
 ** The basic idea is to do a nested loop, one loop for each table in
@@ -7091,6 +7126,17 @@ WhereInfo *sqlite3WhereBegin(
       }
     }
   }
+
+#ifdef SQLITE_ENABLE_GPU_SCAN
+  /* planner check: mark this WhereInfo as eligible for GPU scan
+  ** if the eligibility checker agrees. This bit will be checked
+  ** later by the VDBE/runtime to decide whether to pass it to GPU.
+  */
+  pWInfo->bGpuScan = sqlite3IsGPUEligible(pWInfo);
+  fprintf(stderr, "GPU Scan %s for this query\n",
+          pWInfo->bGpuScan ? "ENABLED" : "NOT enabled");
+  fflush(stderr);
+#endif
 
   /* Open all tables in the pTabList and any indices selected for
   ** searching those tables.

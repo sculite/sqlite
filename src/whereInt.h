@@ -505,6 +505,7 @@ struct WhereInfo {
   Bitmask revMask;          /* Mask of ORDER BY terms that need reversing */
   WhereClause sWC;          /* Decomposition of the WHERE clause */
   WhereMaskSet sMaskSet;    /* Map cursor numbers to bitmasks */
+  unsigned bGpuScan:1;     /* Bit Field to indicate if conservatively GPU elgigible for simplest WHERE scans */
   WhereLevel a[FLEXARRAY];  /* Information about each nest loop in WHERE */
 };
 
