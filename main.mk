@@ -683,6 +683,13 @@ SRC = \
   $(TOP)/src/whereInt.h \
   $(TOP)/src/window.c
 
+# GPU Acceleration source files
+#
+SRC += \
+  $(TOP)/src/gpu_manager.c \
+  $(TOP)/src/gpu_manager.h \
+  $(TOP)/src/gpu_config.h
+
 # Source code for extensions
 #
 SRC += \
