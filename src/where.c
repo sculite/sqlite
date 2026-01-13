@@ -18,6 +18,9 @@
 */
 #include "sqliteInt.h"
 #include "whereInt.h"
+#ifdef SQLITE_ENABLE_GPU_SCAN
+#include "gpu_config.h"
+#endif
 
 /*
 ** Extra information appended to the end of sqlite3_index_info but not
@@ -7891,7 +7894,7 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
   nColumns = pTab->nCol + 1;  
   
 
-  gpuCtx = gpuWhereContextCreate(2000000, nColumns);
+  gpuCtx = gpuWhereContextCreate(GPU_BATCH_SIZE, nColumns);
   if (gpuCtx) {
 
     for(i = 0; i < nConditions; i++) {
@@ -7919,16 +7922,21 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
 
     estimatedRows = 0;
     if( pTab->nRowLogEst > 0 ){
-      estimatedRows = (int)sqlite3LogEstToInt(pTab->nRowLogEst);
-      if( estimatedRows > 2000000 ) estimatedRows = 2000000; /* Cap at 2M rows for memory safety */
+      u64 tempRows = sqlite3LogEstToInt(pTab->nRowLogEst);
+      if( tempRows > GPU_BATCH_SIZE ) {
+        estimatedRows = GPU_BATCH_SIZE;
+      } else {
+        estimatedRows = (int)tempRows;
+      }
     }
-    if( estimatedRows < 1000 ) estimatedRows = 100000; 
+    if( estimatedRows < 1000 ) estimatedRows = 100000;
     
+    int rowReadLimit = GPU_BATCH_SIZE;
 
-    tableData = (long long*)malloc(estimatedRows * nColumns * sizeof(long long));
+    tableData = (long long*)malloc(GPU_BATCH_SIZE * nColumns * sizeof(long long));
     if (!tableData) {
       fprintf(stderr, "GPU: Failed to allocate %lld MB for table data\n", 
-              (long long)(estimatedRows * nColumns * sizeof(long long)) / (1024*1024));
+              (long long)(GPU_BATCH_SIZE * nColumns * sizeof(long long)) / (1024*1024));
       fflush(stderr);
       gpuWhereContextDestroy(gpuCtx);
       return 0;
@@ -7943,7 +7951,10 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
     iDb = sqlite3SchemaToIndex(db, pSchema);
     pBtCur = NULL;
     
-    if( db && actualRows < estimatedRows ){
+    int totalProcessed = 0;
+    int totalMatches = 0;
+    
+    if( db && actualRows < rowReadLimit ){
 
       pBt = db->aDb[iDb].pBt;
       iRoot = pTab->tnum; 
@@ -7959,7 +7970,11 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
             res = 0;
             rc = sqlite3BtreeFirst(pBtCur, &res);
             
-            while( rc == SQLITE_OK && res == 0 && actualRows < estimatedRows ){
+            while( rc == SQLITE_OK && res == 0 ){
+              actualRows = 0;  
+              
+
+              while( rc == SQLITE_OK && res == 0 && actualRows < rowReadLimit ){
               i64 rowid;
               u32 nPayload;
               const u8 *aPayload;
@@ -8054,6 +8069,21 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
               
 
               rc = sqlite3BtreeNext(pBtCur, 0);
+              }
+              
+              if (actualRows > 0) {
+                long long* results;
+                int nResults;
+                
+                results = NULL;
+                nResults = 0;
+                
+                if (gpuWhereContextSetData(gpuCtx, tableData, actualRows) == 0 &&
+                    gpuWhereContextExecute(gpuCtx, &results, &nResults) == 0) {
+                  totalProcessed += actualRows;
+                  totalMatches += nResults;
+                }
+              }
             }
           }
           sqlite3BtreeCloseCursor(pBtCur);
@@ -8061,23 +8091,9 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
       }
     }
     
-    if (actualRows > 0) {
-      long long* results;
-      int nResults;
-      
-      results = NULL;
-      nResults = 0;
-      
-      if (gpuWhereContextSetData(gpuCtx, tableData, actualRows) != 0) {
-        fprintf(stderr, "GPU: Failed to transfer %d rows to GPU memory\n", actualRows);
-        fflush(stderr);
-      } else if (gpuWhereContextExecute(gpuCtx, &results, &nResults) != 0) {
-        fprintf(stderr, "GPU: Kernel execution failed\n");
-        fflush(stderr);
-      } else {
-        fprintf(stderr, "GPU: Processed %d rows, found %d matches\n", actualRows, nResults);
-        fflush(stderr);
-      }
+    if (totalProcessed > 0) {
+      fprintf(stderr, "GPU: Processed %d total rows, found %d total matches\n", totalProcessed, totalMatches);
+      fflush(stderr);
     } else {
       fprintf(stderr, "GPU: No rows read from table\n");
       fflush(stderr);

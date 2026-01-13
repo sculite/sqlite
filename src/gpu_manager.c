@@ -55,31 +55,29 @@ GpuWhereContext* gpuWhereContextCreate(int maxRows, int numColumns) {
     if(!gpuManagerIsAvailable()) {
         return NULL;
     }
-    
-    if(maxRows <= 0 || numColumns <= 0 || numColumns > GPU_MAX_COLUMNS) {
+    // If maxRows is not specified or too small/large, use the default batch size
+    if(maxRows <= 0 || maxRows > GPU_DEFAULT_BATCH_SIZE) {
+        maxRows = GPU_DEFAULT_BATCH_SIZE;
+    }
+    if(numColumns <= 0 || numColumns > GPU_MAX_COLUMNS) {
         return NULL;
     }
-    
     GpuWhereContext* ctx = (GpuWhereContext*)malloc(sizeof(GpuWhereContext));
     if(!ctx) {
         return NULL;
     }
-    
     memset(ctx, 0, sizeof(GpuWhereContext));
-    
     ctx->dataBuffer = (long long*)malloc(maxRows * numColumns * sizeof(long long));
     if(!ctx->dataBuffer) {
         free(ctx);
         return NULL;
     }
-    
     ctx->outputBuffer = (long long*)malloc(maxRows * numColumns * sizeof(long long));
     if(!ctx->outputBuffer) {
         free(ctx->dataBuffer);
         free(ctx);
         return NULL;
     }
-    
     ctx->conditions = (GpuCondition*)malloc(GPU_MAX_CONDITIONS * sizeof(GpuCondition));
     if(!ctx->conditions) {
         free(ctx->outputBuffer);
@@ -87,7 +85,6 @@ GpuWhereContext* gpuWhereContextCreate(int maxRows, int numColumns) {
         free(ctx);
         return NULL;
     }
-    
     ctx->maxRows = maxRows;
     ctx->numColumns = numColumns;
     ctx->numConditions = 0;
@@ -95,7 +92,6 @@ GpuWhereContext* gpuWhereContextCreate(int maxRows, int numColumns) {
     ctx->numRows = 0;
     ctx->isInitialized = 1;
     ctx->gpuAvailable = 1;
-    
     return ctx;
 }
 
