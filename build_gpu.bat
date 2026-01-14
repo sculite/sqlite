@@ -8,9 +8,26 @@ echo.
 
 set BUILD_DIR=build_gpu
 set CUDA_ARCH=sm_89
-set NVCC_FLAGS=-O2 -arch=%CUDA_ARCH% --compiler-options /MT,/W3 -allow-unsupported-compiler -diag-suppress=546
-set CL_FLAGS=/MT /O2 /W3 /D SQLITE_THREADSAFE=1 /D SQLITE_ENABLE_COLUMN_METADATA=1 /D SQLITE_ENABLE_FTS5=1 /D SQLITE_ENABLE_GPU_SCAN=1 /D NDEBUG
-set LINK_FLAGS=/INCREMENTAL:NO /MACHINE:X64
+
+set NVCC_FLAGS=-O3 ^
+-arch=%CUDA_ARCH% ^
+--use_fast_math ^
+--ptxas-options=-O3 ^
+--extra-device-vectorization ^
+-lineinfo ^
+-Xcompiler "/MT /O2 /Ob3 /Oi /Ot /fp:fast /W3" ^
+-allow-unsupported-compiler ^
+-diag-suppress=546
+
+set CL_FLAGS=/MT /O2 /Ob3 /Oi /Ot /Oy /GF /Gy /fp:fast /W3 ^
+/D SQLITE_THREADSAFE=1 ^
+/D SQLITE_ENABLE_COLUMN_METADATA=1 ^
+/D SQLITE_ENABLE_FTS5=1 ^
+/D SQLITE_ENABLE_GPU_SCAN=1 ^
+/D NDEBUG
+
+set LINK_FLAGS=/INCREMENTAL:NO /OPT:REF /OPT:ICF /MACHINE:X64
+
 
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 cd "%BUILD_DIR%"
@@ -97,7 +114,7 @@ link %LINK_FLAGS% /OUT:sqlite3_gpu.exe ^
     sqlite3.obj ^
     gpu_manager.obj ^
     gpu_where.obj ^
-    "%CUDA_PATH%\lib\x64\cudart_static.lib" ^
+    "%CUDA_PATH%\lib\x64\cudart.lib" ^
     kernel32.lib user32.lib advapi32.lib
 
 if errorlevel 1 (
