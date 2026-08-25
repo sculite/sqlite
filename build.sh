@@ -52,8 +52,9 @@ if [[ "$DEBUG" == "1" ]]; then
         -DSQLITE_ENABLE_FTS5=1
         -DSQLITE_ENABLE_GPU_SCAN=1
         -DSQLITE_OMIT_GPU=0
+        -fsanitize=address
     )
-    LINK_FLAGS=(-g)
+    LINK_FLAGS=(-g -Xcompiler=-fsanitize=address)
 else
     NVCC_FLAGS=(
         -O3
