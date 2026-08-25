@@ -322,8 +322,10 @@ typedef struct DeviceScratch {
     Condition* d_conditions;
     int* d_resultMask;
     int* d_scanIndices;
-    int* d_blockSums;       
-    int* d_blockOffsets;    
+    int* d_blockSums;        
+    int* d_blockOffsets;     
+    cudaStream_t transferStream;  
+    cudaStream_t computeStream;  
     size_t dataCapacity;
     size_t outputCapacity;
     size_t conditionCapacity;
@@ -399,6 +401,20 @@ extern "C" int gpuWhereClauseInit(void) {
     fprintf(stderr, "GPU: Compute capability: %d.%d\n", prop.major, prop.minor);
     fprintf(stderr, "GPU: Total memory: %.2f GB\n", prop.totalGlobalMem / (1024.0*1024.0*1024.0));
     
+    //CUDA streams for asyncop
+    err = cudaStreamCreate(&g_deviceScratch.transferStream);
+    if(err != cudaSuccess) {
+        fprintf(stderr, "GPU: Failed to create transfer stream: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    
+    err = cudaStreamCreate(&g_deviceScratch.computeStream);
+    if(err != cudaSuccess) {
+        fprintf(stderr, "GPU: Failed to create compute stream: %s\n", cudaGetErrorString(err));
+        cudaStreamDestroy(g_deviceScratch.transferStream);
+        return -1;
+    }
+    
     g_gpuInitialized = 1;
     return 0;
 }
@@ -413,6 +429,10 @@ extern "C" void gpuWhereClauseCleanup(void) {
         if(g_deviceScratch.d_scanIndices) cudaFree(g_deviceScratch.d_scanIndices);
         if(g_deviceScratch.d_blockSums) cudaFree(g_deviceScratch.d_blockSums);
         if(g_deviceScratch.d_blockOffsets) cudaFree(g_deviceScratch.d_blockOffsets);
+        
+        if(g_deviceScratch.transferStream) cudaStreamDestroy(g_deviceScratch.transferStream);
+        if(g_deviceScratch.computeStream) cudaStreamDestroy(g_deviceScratch.computeStream);
+        
         if(g_hostResultMask) free(g_hostResultMask);
         if(g_hostScanIndices) free(g_hostScanIndices);
 
@@ -451,6 +471,8 @@ extern "C" int gpuWhereClause(
     cudaError_t err = cudaSuccess;
     int numBlocks = 0;
     int resultCount = 0;
+    int lastScanIndex = 0;
+    int lastMask = 0;
     size_t outputSize = 0;
 
     size_t dataSize = (size_t)numRows * (size_t)numColumns * sizeof(long long);
@@ -482,18 +504,25 @@ extern "C" int gpuWhereClause(
         goto cleanup;
     }
 
-    err = cudaMemcpy(g_deviceScratch.d_data, h_data, dataSize, cudaMemcpyHostToDevice);
+    //async memcpy can be pipelined
+    err = cudaMemcpyAsync(g_deviceScratch.d_data, h_data, dataSize, cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
     if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Failed to copy data to device: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "GPU: Failed to async copy data to device: %s\n", cudaGetErrorString(err));
         goto cleanup;
     }
 
     if(numConditions > 0) {
-        err = cudaMemcpy(g_deviceScratch.d_conditions, h_conditions, condSize, cudaMemcpyHostToDevice);
+        err = cudaMemcpyAsync(g_deviceScratch.d_conditions, h_conditions, condSize, cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
         if(err != cudaSuccess) {
-            fprintf(stderr, "GPU: Failed to copy conditions to device: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "GPU: Failed to async copy conditions to device: %s\n", cudaGetErrorString(err));
             goto cleanup;
         }
+    }
+    
+    err = cudaStreamSynchronize(g_deviceScratch.transferStream);
+    if(err != cudaSuccess) {
+        fprintf(stderr, "GPU: Failed to synchronize transfer stream: %s\n", cudaGetErrorString(err));
+        goto cleanup;
     }
 
     numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -518,7 +547,6 @@ extern "C" int gpuWhereClause(
         goto cleanup;
     }
 
-    int lastScanIndex = 0;
     err = cudaMemcpy(&lastScanIndex, g_deviceScratch.d_scanIndices + numRows - 1,
                      sizeof(int), cudaMemcpyDeviceToHost);
     if(err != cudaSuccess) {
@@ -526,7 +554,6 @@ extern "C" int gpuWhereClause(
         goto cleanup;
     }
     
-    int lastMask = 0;
     err = cudaMemcpy(&lastMask, g_deviceScratch.d_resultMask + numRows - 1,
                      sizeof(int), cudaMemcpyDeviceToHost);
     if(err != cudaSuccess) {
@@ -553,11 +580,17 @@ extern "C" int gpuWhereClause(
 
     outputSize = (size_t)resultCount * (size_t)numColumns * sizeof(long long);
     if(outputSize > 0) {
-        err = cudaMemcpy(h_output, g_deviceScratch.d_output, outputSize, cudaMemcpyDeviceToHost);
+        err = cudaMemcpyAsync(h_output, g_deviceScratch.d_output, outputSize, cudaMemcpyDeviceToHost, g_deviceScratch.transferStream);
         if(err != cudaSuccess) {
-            fprintf(stderr, "GPU: Failed to copy results: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "GPU: Failed to async copy results: %s\n", cudaGetErrorString(err));
             goto cleanup;
         }
+    }
+    
+    err = cudaStreamSynchronize(g_deviceScratch.transferStream);
+    if(err != cudaSuccess) {
+        fprintf(stderr, "GPU: Failed to synchronize result transfer: %s\n", cudaGetErrorString(err));
+        goto cleanup;
     }
 
     *h_outputCount = resultCount;
