@@ -13,6 +13,7 @@ echo
 
 BUILD_DIR="build_gpu"
 CUDA_ARCH="sm_89"
+DEBUG="${DEBUG:-0}"
 
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 
@@ -24,37 +25,66 @@ if [[ ! -x "$NVCC" ]]; then
     exit 1
 fi
 
-# CUDA compiler flags
-NVCC_FLAGS=(
-    -O3
-    "-arch=${CUDA_ARCH}"
-    --use_fast_math
-    --ptxas-options=-O3
-    --extra-device-vectorization
-    -lineinfo
-    -Xcompiler
-    "-O3"
-    -allow-unsupported-compiler
-    -diag-suppress=546
-)
+# Compiler flags
+if [[ "$DEBUG" == "1" ]]; then
+    NVCC_FLAGS=(
+        -O0
+        -g
+        -G
+        "-arch=${CUDA_ARCH}"
+        -lineinfo
+        -Xcompiler
+        "-O0"
+        -allow-unsupported-compiler
+        -diag-suppress=546
+    )
 
-# C compiler flags
-C_FLAGS=(
-    -O3
-    -march=native
-    -mtune=native
-    -fomit-frame-pointer
-    -ffast-math
-    -Wall
-    -Wextra
+    C_FLAGS=(
+        -O0
+        -g3
+        -fno-omit-frame-pointer
+        -march=native
+        -mtune=native
+        -Wall
+        -Wextra
+        -DSQLITE_THREADSAFE=1
+        -DSQLITE_ENABLE_COLUMN_METADATA=1
+        -DSQLITE_ENABLE_FTS5=1
+        -DSQLITE_ENABLE_GPU_SCAN=1
+        -DSQLITE_OMIT_GPU=0
+    )
+    LINK_FLAGS=(-g)
+else
+    NVCC_FLAGS=(
+        -O3
+        "-arch=${CUDA_ARCH}"
+        --use_fast_math
+        --ptxas-options=-O3
+        --extra-device-vectorization
+        -lineinfo
+        -Xcompiler
+        "-O3"
+        -allow-unsupported-compiler
+        -diag-suppress=546
+    )
 
-    -DSQLITE_THREADSAFE=1
-    -DSQLITE_ENABLE_COLUMN_METADATA=1
-    -DSQLITE_ENABLE_FTS5=1
-    -DSQLITE_ENABLE_GPU_SCAN=1
-    -DSQLITE_OMIT_GPU=0
-    -DNDEBUG
-)
+    C_FLAGS=(
+        -O3
+        -march=native
+        -mtune=native
+        -fomit-frame-pointer
+        -ffast-math
+        -Wall
+        -Wextra
+        -DSQLITE_THREADSAFE=1
+        -DSQLITE_ENABLE_COLUMN_METADATA=1
+        -DSQLITE_ENABLE_FTS5=1
+        -DSQLITE_ENABLE_GPU_SCAN=1
+        -DSQLITE_OMIT_GPU=0
+        -DNDEBUG
+    )
+    LINK_FLAGS=(-O3)
+fi
 
 # ============================================================
 # CHECK DEPENDENCIES
@@ -287,7 +317,7 @@ echo
 
 "$NVCC" \
     -arch="$CUDA_ARCH" \
-    -O3 \
+    "${LINK_FLAGS[@]}" \
     -o sqlite3_gpu \
     shell.o \
     sqlite3.o \
