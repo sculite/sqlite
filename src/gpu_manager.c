@@ -15,6 +15,15 @@ extern int gpuWhereClause(
     int numConditions,
     int rootConditionIndex
 );
+extern int gpuWhereClauseCount(
+    const long long* h_data,
+    int* h_outputCount,
+    const GpuCondition* h_conditions,
+    int numRows,
+    int numColumns,
+    int numConditions,
+    int rootConditionIndex
+);
 
 static int g_gpuInitialized = 0;
 static int g_gpuAvailable = 0;
@@ -155,6 +164,20 @@ int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* ou
     *outputRows = resultCount;
     
     return 0;
+}
+
+int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows) {
+    if(!ctx || !outputRows || ctx->numRows <= 0) return -1;
+
+    return gpuWhereClauseCount(
+        ctx->dataBuffer,
+        outputRows,
+        ctx->conditions,
+        ctx->numRows,
+        ctx->numColumns,
+        ctx->numConditions,
+        ctx->rootConditionIndex
+    );
 }
 
 int gpuShouldUseGPU(int numRows, int numColumns, int numConditions) {

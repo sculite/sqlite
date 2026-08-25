@@ -7821,6 +7821,7 @@ extern int gpuWhereContextSetData(GpuWhereContext* ctx, const long long* data, i
 extern int gpuWhereContextAddCondition(GpuWhereContext* ctx, const GpuCondition* cond);
 extern int gpuWhereContextSetRootCondition(GpuWhereContext* ctx, int rootIndex);
 extern int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* outputRows);
+extern int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows);
 
 
 static int extractWhereConditions(WhereInfo *pWInfo, GpuCondition *conditions, int maxCond) {
@@ -8080,14 +8081,11 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
               }
               
               if (actualRows > 0) {
-                long long* results;
                 int nResults;
-                
-                results = NULL;
                 nResults = 0;
                 
                 if (gpuWhereContextSetData(gpuCtx, tableData, actualRows) == 0 &&
-                    gpuWhereContextExecute(gpuCtx, &results, &nResults) == 0) {
+                  gpuWhereContextCount(gpuCtx, &nResults) == 0) {
                   totalProcessed += actualRows;
                   totalMatches += nResults;
                 }

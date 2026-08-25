@@ -70,6 +70,8 @@ int gpuWhereContextSetData(GpuWhereContext* ctx, const long long* data, int numR
 
 int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* outputRows);
 
+int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows);
+
 int gpuShouldUseGPU(int numRows, int numColumns, int numConditions);
 
 #ifdef __cplusplus

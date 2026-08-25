@@ -141,6 +141,30 @@ __global__ void compactResultsKernel(
     }
 }
 
+__global__ void countMatchesKernel(
+    const int* resultMask,
+    int* totalMatches,
+    int numRows
+) {
+    __shared__ int blockCount[BLOCK_SIZE];
+    int threadIndex = threadIdx.x;
+    int rowIndex = blockIdx.x * blockDim.x + threadIndex;
+
+    blockCount[threadIndex] = rowIndex < numRows ? resultMask[rowIndex] : 0;
+    __syncthreads();
+
+    for(int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+        if(threadIndex < offset) {
+            blockCount[threadIndex] += blockCount[threadIndex + offset];
+        }
+        __syncthreads();
+    }
+
+    if(threadIndex == 0) {
+        atomicAdd(totalMatches, blockCount[0]);
+    }
+}
+
 
 //GPU kernel for block-level scans
 __global__ void blockScanKernel(
@@ -244,7 +268,8 @@ static int gpuPrefixSum(
     int* d_output,
     int* d_blockSums,
     int* d_blockOffsets,
-    int numRows
+    int numRows,
+    cudaStream_t stream
 ) {
     if(numRows <= 0) return 0;
     
@@ -253,7 +278,7 @@ static int gpuPrefixSum(
     int sharedMemSize = BLOCK_SIZE * 2 * sizeof(int);
     int* h_blockSums = NULL;
     
-    blockScanKernel<<<numBlocks, BLOCK_SIZE, sharedMemSize>>>(
+    blockScanKernel<<<numBlocks, BLOCK_SIZE, sharedMemSize, stream>>>(
         d_input, d_output, d_blockSums, numRows
     );
     
@@ -270,16 +295,23 @@ static int gpuPrefixSum(
             return -1;
         }
         
-        err = cudaMemcpy(h_blockSums, d_blockSums, numBlocks * sizeof(int), cudaMemcpyDeviceToHost);
+        err = cudaMemcpyAsync(h_blockSums, d_blockSums, numBlocks * sizeof(int), cudaMemcpyDeviceToHost, stream);
         if(err != cudaSuccess) {
             fprintf(stderr, "GPU: Failed to copy block sums to host: %s\n", cudaGetErrorString(err));
+            free(h_blockSums);
+            return -1;
+        }
+
+        err = cudaStreamSynchronize(stream);
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Failed to synchronize block sums: %s\n", cudaGetErrorString(err));
             free(h_blockSums);
             return -1;
         }
         
         hostBlockPrefixSum(h_blockSums, numBlocks);
         
-        err = cudaMemcpy(d_blockSums, h_blockSums, numBlocks * sizeof(int), cudaMemcpyHostToDevice);
+        err = cudaMemcpyAsync(d_blockSums, h_blockSums, numBlocks * sizeof(int), cudaMemcpyHostToDevice, stream);
         if(err != cudaSuccess) {
             fprintf(stderr, "GPU: Failed to copy block sums to device: %s\n", cudaGetErrorString(err));
             free(h_blockSums);
@@ -288,7 +320,7 @@ static int gpuPrefixSum(
         
         free(h_blockSums);
         
-        addBlockOffsetsKernel<<<numBlocks, BLOCK_SIZE>>>(
+        addBlockOffsetsKernel<<<numBlocks, BLOCK_SIZE, 0, stream>>>(
             d_output, d_blockSums, numRows
         );
         
@@ -322,6 +354,7 @@ typedef struct DeviceScratch {
     Condition* d_conditions;
     int* d_resultMask;
     int* d_scanIndices;
+    int* d_matchCount;
     int* d_blockSums;        
     int* d_blockOffsets;     
     cudaStream_t transferStream;  
@@ -331,6 +364,7 @@ typedef struct DeviceScratch {
     size_t conditionCapacity;
     size_t maskCapacity;
     size_t scanCapacity;
+    size_t matchCountCapacity;
     size_t blockSumsCapacity;
     size_t blockOffsetsCapacity;
 } DeviceScratch;
@@ -427,6 +461,7 @@ extern "C" void gpuWhereClauseCleanup(void) {
         if(g_deviceScratch.d_conditions) cudaFree(g_deviceScratch.d_conditions);
         if(g_deviceScratch.d_resultMask) cudaFree(g_deviceScratch.d_resultMask);
         if(g_deviceScratch.d_scanIndices) cudaFree(g_deviceScratch.d_scanIndices);
+        if(g_deviceScratch.d_matchCount) cudaFree(g_deviceScratch.d_matchCount);
         if(g_deviceScratch.d_blockSums) cudaFree(g_deviceScratch.d_blockSums);
         if(g_deviceScratch.d_blockOffsets) cudaFree(g_deviceScratch.d_blockOffsets);
         
@@ -463,7 +498,7 @@ extern "C" int gpuWhereClause(
         return -1;
     }
     
-    if(!h_data || !h_output || !h_outputCount) {
+    if(!h_data || !h_outputCount) {
         fprintf(stderr, "GPU: Invalid parameters\n");
         return -1;
     }
@@ -483,7 +518,7 @@ extern "C" int gpuWhereClause(
     if(ensureDeviceBuffer((void**)&g_deviceScratch.d_data, dataSize, &g_deviceScratch.dataCapacity, "device data") != 0) {
         goto cleanup;
     }
-    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_output, dataSize, &g_deviceScratch.outputCapacity, "device output") != 0) {
+    if(h_output && ensureDeviceBuffer((void**)&g_deviceScratch.d_output, dataSize, &g_deviceScratch.outputCapacity, "device output") != 0) {
         goto cleanup;
     }
     if(numConditions > 0) {
@@ -494,13 +529,17 @@ extern "C" int gpuWhereClause(
     if(ensureDeviceBuffer((void**)&g_deviceScratch.d_resultMask, maskSize, &g_deviceScratch.maskCapacity, "device result mask") != 0) {
         goto cleanup;
     }
-    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_scanIndices, maskSize, &g_deviceScratch.scanCapacity, "device scan indices") != 0) {
-        goto cleanup;
-    }
-    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_blockSums, blockSumsSize, &g_deviceScratch.blockSumsCapacity, "device block sums") != 0) {
-        goto cleanup;
-    }
-    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_blockOffsets, blockSumsSize, &g_deviceScratch.blockOffsetsCapacity, "device block offsets") != 0) {
+    if(h_output) {
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_scanIndices, maskSize, &g_deviceScratch.scanCapacity, "device scan indices") != 0) {
+            goto cleanup;
+        }
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_blockSums, blockSumsSize, &g_deviceScratch.blockSumsCapacity, "device block sums") != 0) {
+            goto cleanup;
+        }
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_blockOffsets, blockSumsSize, &g_deviceScratch.blockOffsetsCapacity, "device block offsets") != 0) {
+            goto cleanup;
+        }
+    } else if(ensureDeviceBuffer((void**)&g_deviceScratch.d_matchCount, sizeof(int), &g_deviceScratch.matchCountCapacity, "device match count") != 0) {
         goto cleanup;
     }
 
@@ -526,7 +565,7 @@ extern "C" int gpuWhereClause(
     }
 
     numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    whereClauseKernel<<<numBlocks, BLOCK_SIZE>>>(
+    whereClauseKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
         g_deviceScratch.d_data,
         g_deviceScratch.d_resultMask,
         g_deviceScratch.d_conditions,
@@ -541,53 +580,96 @@ extern "C" int gpuWhereClause(
         goto cleanup;
     }
 
-    if(gpuPrefixSum(g_deviceScratch.d_resultMask, g_deviceScratch.d_scanIndices,
-                   g_deviceScratch.d_blockSums, g_deviceScratch.d_blockOffsets,
-                   numRows) != 0) {
+    if(!h_output) {
+        err = cudaMemsetAsync(g_deviceScratch.d_matchCount, 0, sizeof(int), g_deviceScratch.computeStream);
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Failed to clear match count: %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+
+        countMatchesKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
+            g_deviceScratch.d_resultMask,
+            g_deviceScratch.d_matchCount,
+            numRows
+        );
+
+        err = cudaGetLastError();
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Count kernel launch failed: %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+
+        err = cudaMemcpyAsync(&resultCount, g_deviceScratch.d_matchCount, sizeof(int), cudaMemcpyDeviceToHost, g_deviceScratch.computeStream);
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Failed to copy match count: %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+
+        err = cudaStreamSynchronize(g_deviceScratch.computeStream);
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Failed to synchronize match count: %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+
+        *h_outputCount = resultCount;
         goto cleanup;
     }
 
-    err = cudaMemcpy(&lastScanIndex, g_deviceScratch.d_scanIndices + numRows - 1,
-                     sizeof(int), cudaMemcpyDeviceToHost);
+    if(gpuPrefixSum(g_deviceScratch.d_resultMask, g_deviceScratch.d_scanIndices,
+                   g_deviceScratch.d_blockSums, g_deviceScratch.d_blockOffsets,
+                   numRows, g_deviceScratch.computeStream) != 0) {
+        goto cleanup;
+    }
+
+    err = cudaMemcpyAsync(&lastScanIndex, g_deviceScratch.d_scanIndices + numRows - 1,
+                          sizeof(int), cudaMemcpyDeviceToHost, g_deviceScratch.computeStream);
     if(err != cudaSuccess) {
         fprintf(stderr, "GPU: Failed to copy final scan index: %s\n", cudaGetErrorString(err));
         goto cleanup;
     }
     
-    err = cudaMemcpy(&lastMask, g_deviceScratch.d_resultMask + numRows - 1,
-                     sizeof(int), cudaMemcpyDeviceToHost);
+    err = cudaMemcpyAsync(&lastMask, g_deviceScratch.d_resultMask + numRows - 1,
+                          sizeof(int), cudaMemcpyDeviceToHost, g_deviceScratch.computeStream);
     if(err != cudaSuccess) {
         fprintf(stderr, "GPU: Failed to copy final mask: %s\n", cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    err = cudaStreamSynchronize(g_deviceScratch.computeStream);
+    if(err != cudaSuccess) {
+        fprintf(stderr, "GPU: Failed to synchronize scan results: %s\n", cudaGetErrorString(err));
         goto cleanup;
     }
     
     resultCount = lastScanIndex + lastMask;
 
-    compactResultsKernel<<<numBlocks, BLOCK_SIZE>>>(
-        g_deviceScratch.d_data,
-        g_deviceScratch.d_output,
-        g_deviceScratch.d_resultMask,
-        g_deviceScratch.d_scanIndices,
-        numRows,
-        numColumns
-    );
+    if(h_output) {
+        compactResultsKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
+            g_deviceScratch.d_data,
+            g_deviceScratch.d_output,
+            g_deviceScratch.d_resultMask,
+            g_deviceScratch.d_scanIndices,
+            numRows,
+            numColumns
+        );
 
-    err = cudaGetLastError();
-    if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Compact kernel launch failed: %s\n", cudaGetErrorString(err));
-        goto cleanup;
-    }
-
-    outputSize = (size_t)resultCount * (size_t)numColumns * sizeof(long long);
-    if(outputSize > 0) {
-        err = cudaMemcpyAsync(h_output, g_deviceScratch.d_output, outputSize, cudaMemcpyDeviceToHost, g_deviceScratch.transferStream);
+        err = cudaGetLastError();
         if(err != cudaSuccess) {
-            fprintf(stderr, "GPU: Failed to async copy results: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "GPU: Compact kernel launch failed: %s\n", cudaGetErrorString(err));
             goto cleanup;
+        }
+
+        outputSize = (size_t)resultCount * (size_t)numColumns * sizeof(long long);
+        if(outputSize > 0) {
+            err = cudaMemcpyAsync(h_output, g_deviceScratch.d_output, outputSize, cudaMemcpyDeviceToHost, g_deviceScratch.computeStream);
+            if(err != cudaSuccess) {
+                fprintf(stderr, "GPU: Failed to async copy results: %s\n", cudaGetErrorString(err));
+                goto cleanup;
+            }
         }
     }
     
-    err = cudaStreamSynchronize(g_deviceScratch.transferStream);
+    err = cudaStreamSynchronize(g_deviceScratch.computeStream);
     if(err != cudaSuccess) {
         fprintf(stderr, "GPU: Failed to synchronize result transfer: %s\n", cudaGetErrorString(err));
         goto cleanup;
@@ -597,4 +679,25 @@ extern "C" int gpuWhereClause(
 
 cleanup:
     return (err == cudaSuccess) ? 0 : -1;
+}
+
+extern "C" int gpuWhereClauseCount(
+    const long long* h_data,
+    int* h_outputCount,
+    const Condition* h_conditions,
+    int numRows,
+    int numColumns,
+    int numConditions,
+    int rootConditionIndex
+) {
+    return gpuWhereClause(
+        h_data,
+        NULL,
+        h_outputCount,
+        h_conditions,
+        numRows,
+        numColumns,
+        numConditions,
+        rootConditionIndex
+    );
 }
