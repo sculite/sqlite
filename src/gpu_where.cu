@@ -142,38 +142,165 @@ __global__ void compactResultsKernel(
 }
 
 
-__global__ void scanKernel(const int* input, int* output, int n) {
+//GPU kernel for block-level scans
+__global__ void blockScanKernel(
+    const int* input,
+    int* output,
+    int* blockSums,
+    int n
+) {
     extern __shared__ int temp[];
     
     int thid = threadIdx.x;
     int globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int blockId = blockIdx.x;
     
-    int pout = 0, pin = 1;
-    
-    if(globalIdx < n) {
-        temp[thid] = input[globalIdx];
+    if(thid > 0) {
+        if(globalIdx - 1 < n) {
+            temp[thid] = input[globalIdx - 1];
+        } else {
+            temp[thid] = 0;
+        }
     } else {
-        temp[thid] = 0;
+        temp[thid] = 0; 
     }
     __syncthreads();
     
     for(int offset = 1; offset < blockDim.x; offset *= 2) {
-        pout = 1 - pout;
-        pin = 1 - pout;
-        
+        int val = 0;
         if(thid >= offset) {
-            temp[pout * blockDim.x + thid] = temp[pin * blockDim.x + thid] + temp[pin * blockDim.x + thid - offset];
-        } else {
-            temp[pout * blockDim.x + thid] = temp[pin * blockDim.x + thid];
+            val = temp[thid - offset];
         }
+        __syncthreads();
+        temp[thid] += val;
         __syncthreads();
     }
     
+    if(thid == blockDim.x - 1 && blockSums) {
+        if(globalIdx < n) {
+            blockSums[blockId] = temp[thid] + input[globalIdx];
+        } else {
+            blockSums[blockId] = temp[thid];
+        }
+    }
+    
     if(globalIdx < n) {
-        output[globalIdx] = temp[pout * blockDim.x + thid];
+        output[globalIdx] = temp[thid];
     }
 }
 
+__global__ void addBlockOffsetsKernel(
+    int* output,
+    const int* blockOffsets,
+    int n
+) {
+    int globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if(globalIdx < n && blockIdx.x > 0) {
+        output[globalIdx] += blockOffsets[blockIdx.x - 1];
+    }
+}
+
+__global__ void inclusiveToExclusiveKernel(
+    int* data,
+    int n
+) {
+    int globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if(globalIdx < n) {
+        int current = data[globalIdx];
+        if(globalIdx > 0) {
+
+            __shared__ int shared[256];
+            shared[threadIdx.x] = current;
+            __syncthreads();
+            
+            if(threadIdx.x > 0) {
+                data[globalIdx] = shared[threadIdx.x - 1];
+            } else if(blockIdx.x > 0) {
+                data[globalIdx] = 0;  
+            } else {
+                data[globalIdx] = 0;  
+            }
+        } else {
+            data[globalIdx] = 0;  
+        }
+    }
+}
+
+
+//performs an exclusive prefix sum on the block sums array on the CPU
+static int hostBlockPrefixSum(int* blockSums, int numBlocks) {
+    if(numBlocks <= 1) return 0;
+    
+    for(int i = 1; i < numBlocks; i++) {
+        blockSums[i] += blockSums[i - 1];
+    }
+    return 0;
+}
+
+static int gpuPrefixSum(
+    const int* d_input,
+    int* d_output,
+    int* d_blockSums,
+    int* d_blockOffsets,
+    int numRows
+) {
+    if(numRows <= 0) return 0;
+    
+    cudaError_t err = cudaSuccess;
+    int numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int sharedMemSize = BLOCK_SIZE * 2 * sizeof(int);
+    int* h_blockSums = NULL;
+    
+    blockScanKernel<<<numBlocks, BLOCK_SIZE, sharedMemSize>>>(
+        d_input, d_output, d_blockSums, numRows
+    );
+    
+    err = cudaGetLastError();
+    if(err != cudaSuccess) {
+        fprintf(stderr, "GPU: Block scan kernel failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    
+    if(numBlocks > 1) {
+        h_blockSums = (int*)malloc(numBlocks * sizeof(int));
+        if(!h_blockSums) {
+            fprintf(stderr, "GPU: Failed to allocate host block sums\n");
+            return -1;
+        }
+        
+        err = cudaMemcpy(h_blockSums, d_blockSums, numBlocks * sizeof(int), cudaMemcpyDeviceToHost);
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Failed to copy block sums to host: %s\n", cudaGetErrorString(err));
+            free(h_blockSums);
+            return -1;
+        }
+        
+        hostBlockPrefixSum(h_blockSums, numBlocks);
+        
+        err = cudaMemcpy(d_blockSums, h_blockSums, numBlocks * sizeof(int), cudaMemcpyHostToDevice);
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Failed to copy block sums to device: %s\n", cudaGetErrorString(err));
+            free(h_blockSums);
+            return -1;
+        }
+        
+        free(h_blockSums);
+        
+        addBlockOffsetsKernel<<<numBlocks, BLOCK_SIZE>>>(
+            d_output, d_blockSums, numRows
+        );
+        
+        err = cudaGetLastError();
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Add block offsets kernel failed: %s\n", cudaGetErrorString(err));
+            return -1;
+        }
+    }
+    
+    return 0;
+}
 
 void cpuPrefixSum(const int* input, int* output, int n) {
     if(n <= 0) return;
@@ -186,6 +313,69 @@ void cpuPrefixSum(const int* input, int* output, int n) {
 
 static int g_gpuInitialized = 0;
 static int g_deviceCount = 0;
+
+
+//reusable device and host buffers for GPU operations
+typedef struct DeviceScratch {
+    long long* d_data;
+    long long* d_output;
+    Condition* d_conditions;
+    int* d_resultMask;
+    int* d_scanIndices;
+    int* d_blockSums;       
+    int* d_blockOffsets;    
+    size_t dataCapacity;
+    size_t outputCapacity;
+    size_t conditionCapacity;
+    size_t maskCapacity;
+    size_t scanCapacity;
+    size_t blockSumsCapacity;
+    size_t blockOffsetsCapacity;
+} DeviceScratch;
+
+static DeviceScratch g_deviceScratch = {0};
+static int* g_hostResultMask = NULL;
+static int* g_hostScanIndices = NULL;
+static size_t g_hostResultMaskCapacity = 0;
+static size_t g_hostScanIndicesCapacity = 0;
+
+static int ensureDeviceBuffer(void** ptr, size_t requiredBytes, size_t* capacity, const char* label) {
+    if(*ptr && requiredBytes <= *capacity) {
+        return 0;
+    }
+    if(*ptr) {
+        cudaFree(*ptr);
+        *ptr = NULL;
+    }
+
+    cudaError_t err = cudaMalloc(ptr, requiredBytes);
+    if(err != cudaSuccess) {
+        fprintf(stderr, "GPU: Failed to allocate %s: %s\n", label, cudaGetErrorString(err));
+        return -1;
+    }
+
+    *capacity = requiredBytes;
+    return 0;
+}
+
+static int ensureHostBuffer(int** ptr, size_t requiredBytes, size_t* capacity, const char* label) {
+    if(*ptr && requiredBytes <= *capacity) {
+        return 0;
+    }
+    if(*ptr) {
+        free(*ptr);
+        *ptr = NULL;
+    }
+
+    *ptr = (int*)malloc(requiredBytes);
+    if(!*ptr) {
+        fprintf(stderr, "GPU: Failed to allocate host %s\n", label);
+        return -1;
+    }
+
+    *capacity = requiredBytes;
+    return 0;
+}
 
 extern "C" int gpuWhereClauseInit(void) {
     if(g_gpuInitialized) {
@@ -216,6 +406,22 @@ extern "C" int gpuWhereClauseInit(void) {
 
 extern "C" void gpuWhereClauseCleanup(void) {
     if(g_gpuInitialized) {
+        if(g_deviceScratch.d_data) cudaFree(g_deviceScratch.d_data);
+        if(g_deviceScratch.d_output) cudaFree(g_deviceScratch.d_output);
+        if(g_deviceScratch.d_conditions) cudaFree(g_deviceScratch.d_conditions);
+        if(g_deviceScratch.d_resultMask) cudaFree(g_deviceScratch.d_resultMask);
+        if(g_deviceScratch.d_scanIndices) cudaFree(g_deviceScratch.d_scanIndices);
+        if(g_deviceScratch.d_blockSums) cudaFree(g_deviceScratch.d_blockSums);
+        if(g_deviceScratch.d_blockOffsets) cudaFree(g_deviceScratch.d_blockOffsets);
+        if(g_hostResultMask) free(g_hostResultMask);
+        if(g_hostScanIndices) free(g_hostScanIndices);
+
+        memset(&g_deviceScratch, 0, sizeof(g_deviceScratch));
+        g_hostResultMask = NULL;
+        g_hostScanIndices = NULL;
+        g_hostResultMaskCapacity = 0;
+        g_hostScanIndicesCapacity = 0;
+
         cudaDeviceReset();
         g_gpuInitialized = 0;
     }
@@ -242,149 +448,120 @@ extern "C" int gpuWhereClause(
         return -1;
     }
     
-    cudaError_t err;
-   
+    cudaError_t err = cudaSuccess;
     int numBlocks = 0;
     int resultCount = 0;
     size_t outputSize = 0;
 
-    long long* d_data = NULL;
-    long long* d_output = NULL;
-    Condition* d_conditions = NULL;
-    int* d_resultMask = NULL;
-    int* d_scanIndices = NULL;
-    int* h_resultMask = NULL;
-    int* h_scanIndices = NULL;
-    
-    size_t dataSize = numRows * numColumns * sizeof(long long);
-    size_t maskSize = numRows * sizeof(int);
-    size_t condSize = numConditions * sizeof(Condition);
-    
-    err = cudaMalloc(&d_data, dataSize);
-    if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Failed to allocate device data: %s\n", cudaGetErrorString(err));
+    size_t dataSize = (size_t)numRows * (size_t)numColumns * sizeof(long long);
+    size_t maskSize = (size_t)numRows * sizeof(int);
+    size_t blockSumsSize = ((numRows + BLOCK_SIZE - 1) / BLOCK_SIZE) * sizeof(int);
+    size_t condSize = (size_t)numConditions * sizeof(Condition);
+
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_data, dataSize, &g_deviceScratch.dataCapacity, "device data") != 0) {
         goto cleanup;
     }
-    
-    err = cudaMalloc(&d_output, dataSize);
-    if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Failed to allocate device output: %s\n", cudaGetErrorString(err));
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_output, dataSize, &g_deviceScratch.outputCapacity, "device output") != 0) {
         goto cleanup;
     }
-    
-    err = cudaMalloc(&d_conditions, condSize);
-    if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Failed to allocate device conditions: %s\n", cudaGetErrorString(err));
+    if(numConditions > 0) {
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_conditions, condSize, &g_deviceScratch.conditionCapacity, "device conditions") != 0) {
+            goto cleanup;
+        }
+    }
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_resultMask, maskSize, &g_deviceScratch.maskCapacity, "device result mask") != 0) {
         goto cleanup;
     }
-    
-    err = cudaMalloc(&d_resultMask, maskSize);
-    if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Failed to allocate result mask: %s\n", cudaGetErrorString(err));
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_scanIndices, maskSize, &g_deviceScratch.scanCapacity, "device scan indices") != 0) {
         goto cleanup;
     }
-    
-    err = cudaMalloc(&d_scanIndices, maskSize);
-    if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Failed to allocate scan indices: %s\n", cudaGetErrorString(err));
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_blockSums, blockSumsSize, &g_deviceScratch.blockSumsCapacity, "device block sums") != 0) {
         goto cleanup;
     }
-    
-    h_resultMask = (int*)malloc(maskSize);
-    h_scanIndices = (int*)malloc(maskSize);
-    if(!h_resultMask || !h_scanIndices) {
-        fprintf(stderr, "GPU: Failed to allocate host memory\n");
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_blockOffsets, blockSumsSize, &g_deviceScratch.blockOffsetsCapacity, "device block offsets") != 0) {
         goto cleanup;
     }
-    
-    //Copy data to CUDA device
-    err = cudaMemcpy(d_data, h_data, dataSize, cudaMemcpyHostToDevice);
+
+    err = cudaMemcpy(g_deviceScratch.d_data, h_data, dataSize, cudaMemcpyHostToDevice);
     if(err != cudaSuccess) {
         fprintf(stderr, "GPU: Failed to copy data to device: %s\n", cudaGetErrorString(err));
         goto cleanup;
     }
-    
+
     if(numConditions > 0) {
-        err = cudaMemcpy(d_conditions, h_conditions, condSize, cudaMemcpyHostToDevice);
+        err = cudaMemcpy(g_deviceScratch.d_conditions, h_conditions, condSize, cudaMemcpyHostToDevice);
         if(err != cudaSuccess) {
             fprintf(stderr, "GPU: Failed to copy conditions to device: %s\n", cudaGetErrorString(err));
             goto cleanup;
         }
     }
-    
-    //Exec the WHERE kernel
+
     numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
     whereClauseKernel<<<numBlocks, BLOCK_SIZE>>>(
-        d_data, d_resultMask, d_conditions, numRows, numColumns, rootConditionIndex
+        g_deviceScratch.d_data,
+        g_deviceScratch.d_resultMask,
+        g_deviceScratch.d_conditions,
+        numRows,
+        numColumns,
+        rootConditionIndex
     );
-    
+
     err = cudaGetLastError();
     if(err != cudaSuccess) {
         fprintf(stderr, "GPU: Kernel launch failed: %s\n", cudaGetErrorString(err));
         goto cleanup;
     }
-    
-    err = cudaDeviceSynchronize();
+
+    if(gpuPrefixSum(g_deviceScratch.d_resultMask, g_deviceScratch.d_scanIndices,
+                   g_deviceScratch.d_blockSums, g_deviceScratch.d_blockOffsets,
+                   numRows) != 0) {
+        goto cleanup;
+    }
+
+    int lastScanIndex = 0;
+    err = cudaMemcpy(&lastScanIndex, g_deviceScratch.d_scanIndices + numRows - 1,
+                     sizeof(int), cudaMemcpyDeviceToHost);
     if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Kernel execution failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "GPU: Failed to copy final scan index: %s\n", cudaGetErrorString(err));
         goto cleanup;
     }
     
-
-    err = cudaMemcpy(h_resultMask, d_resultMask, maskSize, cudaMemcpyDeviceToHost);
+    int lastMask = 0;
+    err = cudaMemcpy(&lastMask, g_deviceScratch.d_resultMask + numRows - 1,
+                     sizeof(int), cudaMemcpyDeviceToHost);
     if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Failed to copy result mask: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "GPU: Failed to copy final mask: %s\n", cudaGetErrorString(err));
         goto cleanup;
     }
     
-
-    cpuPrefixSum(h_resultMask, h_scanIndices, numRows);
-    
-    resultCount = h_scanIndices[numRows-1] + h_resultMask[numRows-1];
-    
-
-    err = cudaMemcpy(d_scanIndices, h_scanIndices, maskSize, cudaMemcpyHostToDevice);
-    if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Failed to copy scan indices: %s\n", cudaGetErrorString(err));
-        goto cleanup;
-    }
-    
+    resultCount = lastScanIndex + lastMask;
 
     compactResultsKernel<<<numBlocks, BLOCK_SIZE>>>(
-        d_data, d_output, d_resultMask, d_scanIndices, numRows, numColumns
+        g_deviceScratch.d_data,
+        g_deviceScratch.d_output,
+        g_deviceScratch.d_resultMask,
+        g_deviceScratch.d_scanIndices,
+        numRows,
+        numColumns
     );
-    
+
     err = cudaGetLastError();
     if(err != cudaSuccess) {
         fprintf(stderr, "GPU: Compact kernel launch failed: %s\n", cudaGetErrorString(err));
         goto cleanup;
     }
-    
-    err = cudaDeviceSynchronize();
-    if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Compact kernel execution failed: %s\n", cudaGetErrorString(err));
-        goto cleanup;
-    }
-    
 
-    outputSize = resultCount * numColumns * sizeof(long long);
-    err = cudaMemcpy(h_output, d_output, outputSize, cudaMemcpyDeviceToHost);
-    if(err != cudaSuccess) {
-        fprintf(stderr, "GPU: Failed to copy results: %s\n", cudaGetErrorString(err));
-        goto cleanup;
+    outputSize = (size_t)resultCount * (size_t)numColumns * sizeof(long long);
+    if(outputSize > 0) {
+        err = cudaMemcpy(h_output, g_deviceScratch.d_output, outputSize, cudaMemcpyDeviceToHost);
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Failed to copy results: %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
     }
-    
+
     *h_outputCount = resultCount;
-    
-    //YES i know, goto cleanup, let me be man
+
 cleanup:
-    if(d_data) cudaFree(d_data);
-    if(d_output) cudaFree(d_output);
-    if(d_conditions) cudaFree(d_conditions);
-    if(d_resultMask) cudaFree(d_resultMask);
-    if(d_scanIndices) cudaFree(d_scanIndices);
-    if(h_resultMask) free(h_resultMask);
-    if(h_scanIndices) free(h_scanIndices);
-    
     return (err == cudaSuccess) ? 0 : -1;
 }
