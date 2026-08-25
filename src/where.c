@@ -7142,8 +7142,7 @@ WhereInfo *sqlite3WhereBegin(
   fprintf(stderr, "GPU Scan %s for this query\n",
           pWInfo->bGpuScan ? "ENABLED" : "NOT enabled");
   fflush(stderr);
-  
-  /* If GPU scan is enabled, execute it now */
+
   if( pWInfo->bGpuScan ){
     sqlite3WhereInitGpuScan(pWInfo);
   }
@@ -7911,8 +7910,8 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
       for(i = 0; i < nConditions - 1; i++){
         memset(&andCond, 0, sizeof(GpuCondition));
         andCond.opCode = 6; 
-        andCond.leftChild = i;
-        andCond.rightChild = (i == nConditions - 2) ? i + 1 : nConditions + i + 1;
+        andCond.leftChild = i == 0 ? 0 : nConditions + i - 1;
+        andCond.rightChild = i + 1;
         andCond.columnIndex = -1;
         gpuWhereContextAddCondition(gpuCtx, &andCond);
       }
@@ -7957,14 +7956,19 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
     int totalProcessed = 0;
     int totalMatches = 0;
     
-    if( db && actualRows < rowReadLimit ){
+    if( db && iDb >= 0 && actualRows < rowReadLimit ){
 
       pBt = db->aDb[iDb].pBt;
       iRoot = pTab->tnum; 
       
       if( pBt && iRoot > 0 ){
 
-        pBtCur = (BtCursor*)sqlite3MallocZero(sqlite3BtreeCursorSize());
+        rc = sqlite3BtreeBeginTrans(pBt, 0, 0);
+        if( rc != SQLITE_OK ){
+          pBt = NULL;
+        }
+
+        pBtCur = pBt ? (BtCursor*)sqlite3MallocZero(sqlite3BtreeCursorSize()) : NULL;
         if( pBtCur ){
           rc = sqlite3BtreeCursor(pBt, iRoot, 0, 0, pBtCur);
           
@@ -8004,6 +8008,7 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
 
                   idx = getVarint32(aPayload, nHdr);
                   offset = nHdr;
+                  col = 1;
                   
 
                   p1 = idx;
