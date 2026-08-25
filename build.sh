@@ -14,6 +14,7 @@ echo
 BUILD_DIR="build_gpu"
 CUDA_ARCH="sm_89"
 DEBUG="${DEBUG:-0}"
+ASAN="${ASAN:-0}"
 
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 
@@ -52,9 +53,12 @@ if [[ "$DEBUG" == "1" ]]; then
         -DSQLITE_ENABLE_FTS5=1
         -DSQLITE_ENABLE_GPU_SCAN=1
         -DSQLITE_OMIT_GPU=0
-        -fsanitize=address
     )
-    LINK_FLAGS=(-g -Xcompiler=-fsanitize=address)
+    LINK_FLAGS=(-g)
+    if [[ "$ASAN" == "1" ]]; then
+        C_FLAGS+=(-fsanitize=address)
+        LINK_FLAGS+=(-Xcompiler=-fsanitize=address)
+    fi
 else
     NVCC_FLAGS=(
         -O3
