@@ -243,7 +243,10 @@ extern "C" int gpuWhereClause(
     }
     
     cudaError_t err;
-    
+   
+    int numBlocks = 0;
+    int resultCount = 0;
+    size_t outputSize = 0;
 
     long long* d_data = NULL;
     long long* d_output = NULL;
@@ -310,7 +313,7 @@ extern "C" int gpuWhereClause(
     }
     
     //Exec the WHERE kernel
-    int numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
     whereClauseKernel<<<numBlocks, BLOCK_SIZE>>>(
         d_data, d_resultMask, d_conditions, numRows, numColumns, rootConditionIndex
     );
@@ -337,7 +340,7 @@ extern "C" int gpuWhereClause(
 
     cpuPrefixSum(h_resultMask, h_scanIndices, numRows);
     
-    int resultCount = h_scanIndices[numRows-1] + h_resultMask[numRows-1];
+    resultCount = h_scanIndices[numRows-1] + h_resultMask[numRows-1];
     
 
     err = cudaMemcpy(d_scanIndices, h_scanIndices, maskSize, cudaMemcpyHostToDevice);
@@ -364,7 +367,7 @@ extern "C" int gpuWhereClause(
     }
     
 
-    size_t outputSize = resultCount * numColumns * sizeof(long long);
+    outputSize = resultCount * numColumns * sizeof(long long);
     err = cudaMemcpy(h_output, d_output, outputSize, cudaMemcpyDeviceToHost);
     if(err != cudaSuccess) {
         fprintf(stderr, "GPU: Failed to copy results: %s\n", cudaGetErrorString(err));

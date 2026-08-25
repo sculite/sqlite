@@ -6719,6 +6719,9 @@ static int sqlite3IsGPUEligible(WhereInfo *pWInfo){
 ** be used to compute the appropriate cursor depending on which index is
 ** used.
 */
+
+SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo);
+
 WhereInfo *sqlite3WhereBegin(
   Parse *pParse,          /* The parser context */
   SrcList *pTabList,      /* FROM clause: A list of all tables to be scanned */
