@@ -7566,11 +7566,26 @@ void sqlite3WhereEnd(WhereInfo *pWInfo){
             pIter->count = 0;
             pIter->idx = 0;
             pIter->pGpuCtx = pWInfo->pGpuCtx;
+            pIter->isAggregateOnly = 0;
+            pIter->aggregateCount = 0;
             {
               Table *pTab = pWInfo->pTabList->a[0].pSTab;
               pIter->nColumns = pTab ? pTab->nCol + 1 : 0;
               pIter->iDb = pTab ? sqlite3SchemaToIndex(db, pTab->pSchema) : 0;
               pIter->iRootPage = pTab ? pTab->tnum : 0;
+            }
+
+            // For now DETECT ONLY COUNT(*), no groupbys either, other aggregates dont use this path yet
+            if( pWInfo->pSelect
+             && (pWInfo->pSelect->selFlags & SF_Aggregate)!=0
+             && pWInfo->pSelect->pGroupBy==0
+             && pWInfo->pSelect->pEList!=0
+             && pWInfo->pSelect->pEList->nExpr==1 ){
+              Expr *pE = pWInfo->pSelect->pEList->a[0].pExpr;
+              if( pE->op==TK_AGG_FUNCTION
+               && (pE->x.pList==0 || pE->x.pList->nExpr==0) ){
+                pIter->isAggregateOnly = 1;
+              }
             }
             pWInfo->pGpuCtx = NULL;  
             addrGpuScan = sqlite3VdbeAddOp3(v, OP_GpuScan,

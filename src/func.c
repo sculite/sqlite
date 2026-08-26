@@ -2058,7 +2058,19 @@ static void countStep(sqlite3_context *context, int argc, sqlite3_value **argv){
   CountCtx *p;
   p = sqlite3_aggregate_context(context, sizeof(*p));
   if( (argc==0 || SQLITE_NULL!=sqlite3_value_type(argv[0])) && p ){
+#ifdef SQLITE_ENABLE_GPU_SCAN
+    {
+      sqlite3 *db = sqlite3_context_db_handle(context);
+      if( db->gpuAggActive ){
+        p->n = db->gpuAggCount;
+        db->gpuAggActive = 0;
+      }else{
+        p->n++;
+      }
+    }
+#else
     p->n++;
+#endif
   }
 
 #ifndef SQLITE_OMIT_DEPRECATED

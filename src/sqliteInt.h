@@ -1802,6 +1802,10 @@ struct sqlite3 {
   void (*xUnlockNotify)(void **, int);  /* Unlock notify callback */
   sqlite3 *pNextBlocked;        /* Next in list of all blocked connections */
 #endif
+#ifdef SQLITE_ENABLE_GPU_SCAN
+  i64 gpuAggCount;              //count computed by GPU for aggregate short path
+  u8 gpuAggActive;              //just a flag to indicate if GPU agg can be used
+#endif
 };
 
 /*

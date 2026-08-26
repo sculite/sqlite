@@ -757,6 +757,8 @@ typedef struct GpuRowidIter {
   int nColumns;     
   int iDb;          
   int iRootPage;    
+  int isAggregateOnly;  
+  int aggregateCount;   
 } GpuRowidIter;
 
 typedef struct GpuWhereContext GpuWhereContext;
@@ -767,6 +769,7 @@ extern int gpuWhereContextAddCondition(GpuWhereContext* ctx, const GpuCondition*
 extern int gpuWhereContextSetRootCondition(GpuWhereContext* ctx, int rootIndex);
 extern int gpuWhereContextSetData(GpuWhereContext* ctx, const long long* data, int numRows);
 extern int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* outputRows);
+extern int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows);
 #endif
 
 #endif /* !defined(SQLITE_VDBEINT_H) */
