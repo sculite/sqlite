@@ -9093,6 +9093,243 @@ case OP_Abortable: {
 }
 #endif
 
+#ifdef SQLITE_ENABLE_GPU_SCAN
+#include "gpu_config.h"
+/* Opcode: GpuScan P1 P2 * P4 *
+** Synopsis: seek to next GPU-matching rowid
+**
+** P1 is a cursor number for a rowid table. P2 is a jump destination.
+** P4.p points to a GpuRowidIter. If rowids are pre-computed, this seeks
+** the cursor to each successive rowid. If pGpuCtx is set (deferred mode),
+** the first call performs a full Btree scan + GPU filter within the VDBE's
+** active transaction, then iterates.
+*/
+case OP_GpuScan: {        
+  VdbeCursor *pC;
+  GpuRowidIter *pIter;
+  i64 rowid;
+  int res;
+
+  pIter = (GpuRowidIter*)pOp->p4.p;
+  assert( pIter!=0 );
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->eCurType==CURTYPE_BTREE );
+
+  if( pIter->pGpuCtx && !pIter->rowids ){
+    GpuWhereContext *gpuCtx = (GpuWhereContext*)pIter->pGpuCtx;
+    BtCursor *pBtCur;
+    sqlite3 *db;
+    int nColumns;
+    Btree *pBt;
+    int actualRows;
+    long long *tableData;
+    long long *allRowids = NULL;
+    int totalRowids = 0;
+    int rowidsCapacity = 0;
+    int rc2;
+
+    db = p->db;
+    nColumns = pIter->nColumns;
+    
+    if( !db || nColumns <= 0 ) goto gpuScanDeferredDone;
+    pBt = db->aDb[pIter->iDb].pBt;
+    if( !pBt || pIter->iRootPage <= 0 ) goto gpuScanDeferredDone;
+
+    tableData = (long long*)sqlite3DbMallocRaw(db,
+        (u64)GPU_BATCH_SIZE * (u64)nColumns * sizeof(long long));
+    if( !tableData ) goto gpuScanDeferredDone;
+
+
+    pBtCur = (BtCursor*)sqlite3MallocZero(sqlite3BtreeCursorSize());
+    if( pBtCur ){
+      rc2 = sqlite3BtreeCursor(pBt, pIter->iRootPage, 0, 0, pBtCur);
+      if( rc2 == SQLITE_OK ){
+        int scanRes = 0;
+        rc2 = sqlite3BtreeFirst(pBtCur, &scanRes);
+        
+        while( rc2 == SQLITE_OK && scanRes == 0 ){
+          actualRows = 0;
+          while( rc2 == SQLITE_OK && scanRes == 0
+                 && actualRows < GPU_BATCH_SIZE ){
+            i64 curRowid;
+            u32 nPayload;
+            const u8 *aPayload;
+            u32 nLocal, offset;
+            u32 nHdr;
+            u32 idx;
+            u32 p1;
+            int col;
+            
+            curRowid = sqlite3BtreeIntegerKey(pBtCur);
+            nPayload = sqlite3BtreePayloadSize(pBtCur);
+            aPayload = NULL;
+            
+            if( nPayload > 0 ){
+              aPayload = sqlite3BtreePayloadFetch(pBtCur, &nLocal);
+              if( aPayload && nLocal >= nPayload ){
+                tableData[actualRows * nColumns + 0] = curRowid;
+
+                idx = getVarint32(aPayload, nHdr);
+                offset = nHdr;
+                p1 = idx;
+                for(col = 1; col < nColumns && p1 < nHdr; col++){
+                  u32 serial_type;
+                  i64 value;
+                  int len;
+                  
+                  p1 += getVarint32(aPayload + p1, serial_type);
+                  value = 0;
+                  
+                  if( serial_type == 0 ){
+                    value = 0;
+                  } else if( serial_type == 1 ){
+                    value = (signed char)aPayload[offset];
+                    offset += 1;
+                  } else if( serial_type == 2 ){
+                    value = (aPayload[offset] << 8) | aPayload[offset+1];
+                    if( value & 0x8000 ) value -= 65536;
+                    offset += 2;
+                  } else if( serial_type == 3 ){
+                    value = (aPayload[offset] << 16) | (aPayload[offset+1] << 8) | aPayload[offset+2];
+                    if( value & 0x800000 ) value -= 16777216;
+                    offset += 3;
+                  } else if( serial_type == 4 ){
+                    value = (aPayload[offset] << 24) | (aPayload[offset+1] << 16) |
+                            (aPayload[offset+2] << 8) | aPayload[offset+3];
+                    offset += 4;
+                  } else if( serial_type == 5 ){
+                    value = (((i64)aPayload[offset]) << 40) | (((i64)aPayload[offset+1]) << 32) |
+                            (((i64)aPayload[offset+2]) << 24) | (((i64)aPayload[offset+3]) << 16) |
+                            (((i64)aPayload[offset+4]) << 8) | aPayload[offset+5];
+                    if( value & 0x800000000000LL ) value -= 281474976710656LL;
+                    offset += 6;
+                  } else if( serial_type == 6 ){
+                    value = (((i64)aPayload[offset]) << 56) | (((i64)aPayload[offset+1]) << 48) |
+                            (((i64)aPayload[offset+2]) << 40) | (((i64)aPayload[offset+3]) << 32) |
+                            (((i64)aPayload[offset+4]) << 24) | (((i64)aPayload[offset+5]) << 16) |
+                            (((i64)aPayload[offset+6]) << 8) | aPayload[offset+7];
+                    offset += 8;
+                  } else if( serial_type == 8 ){
+                    value = 0;
+                  } else if( serial_type == 9 ){
+                    value = 1;
+                  } else {
+                    len = sqlite3VdbeSerialTypeLen(serial_type);
+                    offset += len;
+                    value = 0;
+                  }
+                  
+                  tableData[actualRows * nColumns + col] = value;
+                }
+                while( col < nColumns ){
+                  tableData[actualRows * nColumns + col] = 0;
+                  col++;
+                }
+                actualRows++;
+              }
+            }
+            rc2 = sqlite3BtreeNext(pBtCur, 0);
+          }
+          
+          if( actualRows > 0 ){
+            long long *batchRowids = NULL;
+            int batchCount = 0;
+            int setDataRc, getRowidsRc;
+            setDataRc = gpuWhereContextSetData(gpuCtx, tableData, actualRows);
+            if( setDataRc == 0 ){
+              getRowidsRc = gpuWhereContextRowids(gpuCtx, &batchRowids, &batchCount);
+              if( getRowidsRc == 0 && batchCount > 0 ){
+                int newCap = rowidsCapacity ? rowidsCapacity * 2 : 1024*1024;
+                long long *tmp;
+                while( newCap < totalRowids + batchCount ) newCap *= 2;
+                tmp = (long long*)sqlite3DbMallocRaw(db, (u64)newCap * sizeof(long long));
+                if( tmp ){
+                  if( allRowids ){
+                    memcpy(tmp, allRowids, (u64)totalRowids * sizeof(long long));
+                    sqlite3DbFree(db, allRowids);
+                  }
+                  allRowids = tmp;
+                  rowidsCapacity = newCap;
+                }else{
+                  break;
+                }
+                memcpy(allRowids + totalRowids, batchRowids,
+                       (u64)batchCount * sizeof(long long));
+                totalRowids += batchCount;
+              }
+            }
+          }
+        }
+        sqlite3BtreeCloseCursor(pBtCur);
+      }else{
+        sqlite3DbFreeNN(db, pBtCur);
+      }
+    }
+    sqlite3DbFree(db, tableData);
+    
+    gpuWhereContextDestroy(gpuCtx);
+    pIter->pGpuCtx = NULL;
+
+    if( allRowids && totalRowids > 0 ){
+      int k;
+      for(k = 1; k < totalRowids; k++){
+        long long key = allRowids[k];
+        int j = k - 1;
+        while( j >= 0 && allRowids[j] > key ){
+          allRowids[j+1] = allRowids[j];
+          j--;
+        }
+        allRowids[j+1] = key;
+      }
+      pIter->rowids = allRowids;
+      pIter->count = totalRowids;
+
+      pIter->idx = 0;
+      if( !pC->nullRow && pC->uc.pCursor ){
+        i64 curKey = sqlite3BtreeIntegerKey(pC->uc.pCursor);
+        if( curKey == allRowids[0] ){
+          pIter->idx = 1;
+        }
+      }
+    }else{
+      sqlite3DbFree(db, allRowids);
+gpuScanDeferredDone:
+      gpuWhereContextDestroy((GpuWhereContext*)pIter->pGpuCtx);
+      pIter->pGpuCtx = NULL;
+      pIter->rowids = NULL;
+      pIter->count = 0;
+      pIter->idx = 0;
+    }
+  }
+
+gpuScanNext:
+  if( pIter->idx >= pIter->count ){
+    rc = SQLITE_OK;
+    pC->nullRow = 1;
+    goto check_for_interrupt;
+  }
+  rowid = pIter->rowids[pIter->idx++];
+  res = 0;
+  rc = sqlite3BtreeTableMoveto(pC->uc.pCursor, rowid, 0, &res);
+  if( rc ) goto abort_due_to_error;
+  if( res!=0 ) goto gpuScanNext;  
+  pC->nullRow = 0;
+#ifdef SQLITE_DEBUG
+  pC->seekOp = OP_GpuScan;
+#endif
+  pC->deferredMoveto = 0;
+  pC->movetoTarget = rowid;
+  pC->cacheStatus = CACHE_STALE;
+  p->aCounter[pOp->p5]++;
+#ifdef SQLITE_TEST
+  sqlite3_search_count++;
+#endif
+  goto jump_to_p2_and_check_for_interrupt;
+}
+#endif /* SQLITE_ENABLE_GPU_SCAN */
+
 #ifdef SQLITE_DEBUG
 /* Opcode:  ReleaseReg   P1 P2 P3 * P5
 ** Synopsis: release r[P1@P2] mask P3

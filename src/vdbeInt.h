@@ -747,4 +747,26 @@ int sqlite3VdbeCheckFkDeferred(Vdbe*);
   #define ExpandBlob(P) SQLITE_OK
 #endif
 
+#ifdef SQLITE_ENABLE_GPU_SCAN
+
+typedef struct GpuRowidIter {
+  i64 *rowids;      
+  int count;      
+  int idx;          
+  void *pGpuCtx;     
+  int nColumns;     
+  int iDb;          
+  int iRootPage;    
+} GpuRowidIter;
+
+typedef struct GpuWhereContext GpuWhereContext;
+typedef struct GpuCondition GpuCondition;
+extern GpuWhereContext* gpuWhereContextCreate(int maxRows, int numColumns);
+extern void gpuWhereContextDestroy(GpuWhereContext* ctx);
+extern int gpuWhereContextAddCondition(GpuWhereContext* ctx, const GpuCondition* cond);
+extern int gpuWhereContextSetRootCondition(GpuWhereContext* ctx, int rootIndex);
+extern int gpuWhereContextSetData(GpuWhereContext* ctx, const long long* data, int numRows);
+extern int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* outputRows);
+#endif
+
 #endif /* !defined(SQLITE_VDBEINT_H) */

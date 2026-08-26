@@ -72,6 +72,8 @@ int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* ou
 
 int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows);
 
+int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* outputRows);
+
 int gpuShouldUseGPU(int numRows, int numColumns, int numConditions);
 
 #ifdef __cplusplus

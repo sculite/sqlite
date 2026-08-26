@@ -2624,6 +2624,10 @@ static void whereInfoFree(sqlite3 *db, WhereInfo *pWInfo){
     sqlite3DbNNFreeNN(db, pWInfo->pMemToFree);
     pWInfo->pMemToFree = pNext;
   }
+#ifdef SQLITE_ENABLE_GPU_SCAN
+  if( pWInfo->pGpuRowids ) sqlite3DbFree(db, pWInfo->pGpuRowids);
+  if( pWInfo->pGpuCtx ) gpuWhereContextDestroy((GpuWhereContext*)pWInfo->pGpuCtx);
+#endif
   sqlite3DbNNFreeNN(db, pWInfo);
 }
 
@@ -6618,9 +6622,28 @@ static int sqlite3IsGPUEligible(WhereInfo *pWInfo){
   /* Only consider single-table plans for nkw */
   if( pWInfo->nLevel!=1 ) return 0;
   if( pWInfo->pTabList==0 ) return 0;
-  /* Reject virtual tables */
-  if( IsVirtual(pWInfo->pTabList->a[0].pSTab) ) return 0;
+  /* Reject non-normal tables (virtual=1, view=2) */
+  if( pWInfo->pTabList->a[0].pSTab->eTabType!=0 ) return 0;
+  /* Reject system tables (sqlite_master, sqlite_temp_master, etc.) */
+  if( pWInfo->pTabList->a[0].pSTab->zName ){
+    const char *zName = pWInfo->pTabList->a[0].pSTab->zName;
+    if( sqlite3_strnicmp(zName, "sqlite_", 7)==0 ) return 0;
+  }
+  /* Reject CTEs and recursive references */
+  if( pWInfo->pTabList->a[0].fg.isCte ) return 0;
+  if( pWInfo->pTabList->a[0].fg.isRecursive ) return 0;
+  /* Reject subqueries */
+  if( pWInfo->pTabList->a[0].fg.isSubquery ) return 0;
+  /* Reject DML statements (INSERT/UPDATE/DELETE) - the Btree scan
+  ** during planning corrupts the transaction state for VDBE execution */
+  if( pWInfo->wctrlFlags & WHERE_ONEPASS_DESIRED ) return 0;
+  /* Reject if statement is multi-write (INSERT/UPDATE/DELETE) */
+  if( pWInfo->pParse->isMultiWrite ) return 0;
+  /* Only accelerate SELECT statements - pSelect is NULL for DML */
+  if( pWInfo->pSelect == 0 ) return 0;
   pWC = &pWInfo->sWC;
+  /* Need at least one WHERE term */
+  if( pWC->nTerm < 1 ) return 0;
   /* No OR terms either */
   if( pWC->hasOr ) return 0;
   for(i=0; i<pWC->nTerm; i++){
@@ -6814,6 +6837,12 @@ WhereInfo *sqlite3WhereBegin(
   pWInfo->pSelect = pSelect;
   memset(&pWInfo->nOBSat, 0,
          offsetof(WhereInfo,sWC) - offsetof(WhereInfo,nOBSat));
+#ifdef SQLITE_ENABLE_GPU_SCAN
+  pWInfo->pGpuRowids = 0;
+  pWInfo->nGpuRowids = 0;
+  pWInfo->pGpuCtx = 0;
+  pWInfo->bGpuScan = 0;
+#endif
   memset(&pWInfo->a[0], 0, sizeof(WhereLoop)+nTabList*sizeof(WhereLevel));
   assert( pWInfo->eOnePass==ONEPASS_OFF );  /* ONEPASS defaults to OFF */
   pMaskSet = &pWInfo->sMaskSet;
@@ -7139,9 +7168,6 @@ WhereInfo *sqlite3WhereBegin(
   ** later by the VDBE/runtime to decide whether to pass it to GPU.
   */
   pWInfo->bGpuScan = sqlite3IsGPUEligible(pWInfo);
-  fprintf(stderr, "GPU Scan %s for this query\n",
-          pWInfo->bGpuScan ? "ENABLED" : "NOT enabled");
-  fflush(stderr);
 
   if( pWInfo->bGpuScan ){
     sqlite3WhereInitGpuScan(pWInfo);
@@ -7507,8 +7533,67 @@ void sqlite3WhereEnd(WhereInfo *pWInfo){
     }
     sqlite3VdbeResolveLabel(v, pLevel->addrCont);
     if( pLevel->op!=OP_Noop ){
-      sqlite3VdbeAddOp3(v, pLevel->op, pLevel->p1, pLevel->p2, pLevel->p3);
-      sqlite3VdbeChangeP5(v, pLevel->p5);
+#ifdef SQLITE_ENABLE_GPU_SCAN
+      if( pWInfo->bGpuScan
+       && pLevel->op==OP_Next
+       && (pWInfo->pGpuRowids || pWInfo->pGpuCtx)
+      ){
+        int addrGpuScan;
+        if( pWInfo->pGpuRowids && pWInfo->nGpuRowids > 0 ){
+          GpuRowidIter *pIter = (GpuRowidIter*)sqlite3DbMallocRawNN(db,
+              (u64)sizeof(GpuRowidIter) + (u64)pWInfo->nGpuRowids * sizeof(i64));
+          if( pIter ){
+            pIter->rowids = (i64*)(pIter + 1);
+            memcpy(pIter->rowids, pWInfo->pGpuRowids,
+                   (u64)pWInfo->nGpuRowids * sizeof(i64));
+            pIter->count = pWInfo->nGpuRowids;
+            pIter->idx = 0;
+            pIter->pGpuCtx = NULL;
+            addrGpuScan = sqlite3VdbeAddOp3(v, OP_GpuScan,
+                pLevel->p1, pLevel->p2, 0);
+            sqlite3VdbeChangeP4(v, addrGpuScan, (const char*)pIter, P4_DYNAMIC);
+            sqlite3VdbeChangeP5(v, pLevel->p5);
+            VdbeComment((v, "GPU: seek %d matching rowids", pWInfo->nGpuRowids));
+          }else{
+            sqlite3VdbeAddOp3(v, pLevel->op, pLevel->p1, pLevel->p2, pLevel->p3);
+            sqlite3VdbeChangeP5(v, pLevel->p5);
+          }
+        }else if( pWInfo->pGpuCtx ){
+          GpuRowidIter *pIter = (GpuRowidIter*)sqlite3DbMallocZero(db,
+              (u64)sizeof(GpuRowidIter));
+          if( pIter ){
+            pIter->rowids = NULL;
+            pIter->count = 0;
+            pIter->idx = 0;
+            pIter->pGpuCtx = pWInfo->pGpuCtx;
+            {
+              Table *pTab = pWInfo->pTabList->a[0].pSTab;
+              pIter->nColumns = pTab ? pTab->nCol + 1 : 0;
+              pIter->iDb = pTab ? sqlite3SchemaToIndex(db, pTab->pSchema) : 0;
+              pIter->iRootPage = pTab ? pTab->tnum : 0;
+            }
+            pWInfo->pGpuCtx = NULL;  
+            addrGpuScan = sqlite3VdbeAddOp3(v, OP_GpuScan,
+                pLevel->p1, pLevel->p2, 0);
+            sqlite3VdbeChangeP4(v, addrGpuScan, (const char*)pIter, P4_DYNAMIC);
+            sqlite3VdbeChangeP5(v, pLevel->p5);
+            VdbeComment((v, "GPU: deferred Btree scan"));
+          }else{
+            gpuWhereContextDestroy((GpuWhereContext*)pWInfo->pGpuCtx);
+            pWInfo->pGpuCtx = NULL;
+            sqlite3VdbeAddOp3(v, pLevel->op, pLevel->p1, pLevel->p2, pLevel->p3);
+            sqlite3VdbeChangeP5(v, pLevel->p5);
+          }
+        }else{
+          sqlite3VdbeAddOp3(v, pLevel->op, pLevel->p1, pLevel->p2, pLevel->p3);
+          sqlite3VdbeChangeP5(v, pLevel->p5);
+        }
+      }else
+#endif
+      {
+        sqlite3VdbeAddOp3(v, pLevel->op, pLevel->p1, pLevel->p2, pLevel->p3);
+        sqlite3VdbeChangeP5(v, pLevel->p5);
+      }
       VdbeCoverage(v);
       VdbeCoverageIf(v, pLevel->op==OP_Next);
       VdbeCoverageIf(v, pLevel->op==OP_Prev);
@@ -7812,6 +7897,12 @@ typedef struct GpuCondition {
   int rightChild;       /* Index of right child condition */
 } GpuCondition;
 
+static int gpuRowidCompare(const void *a, const void *b){
+  long long va = *(const long long*)a;
+  long long vb = *(const long long*)b;
+  return (va > vb) - (va < vb);
+}
+
 typedef struct GpuWhereContext GpuWhereContext;
 
 
@@ -7822,6 +7913,7 @@ extern int gpuWhereContextAddCondition(GpuWhereContext* ctx, const GpuCondition*
 extern int gpuWhereContextSetRootCondition(GpuWhereContext* ctx, int rootIndex);
 extern int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* outputRows);
 extern int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows);
+extern int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* outputRows);
 
 
 static int extractWhereConditions(WhereInfo *pWInfo, GpuCondition *conditions, int maxCond) {
@@ -7848,16 +7940,32 @@ static int extractWhereConditions(WhereInfo *pWInfo, GpuCondition *conditions, i
     else continue;
     
 
-    cond->columnIndex = pTerm->u.x.leftColumn + 1;
-    
+    {
+      Table *pTab = pWInfo->pTabList->a[0].pSTab;
+      int leftCol = pTerm->u.x.leftColumn;
+      int iPKey = pTab ? pTab->iPKey : -1;
+      if( iPKey >= 0 && leftCol == iPKey ){
+        cond->columnIndex = 0;  //IPK mapps to rowid, so we use columnIndex 0 for it
+      }else{
+        cond->columnIndex = leftCol + 1;  
+      }
+    }
 
     if( pTerm->pExpr && pTerm->pExpr->pRight ) {
       Expr *pRight = pTerm->pExpr->pRight;
-      if( pRight->op == TK_INTEGER ) {
+      if( pRight->flags & EP_IntValue ){
         cond->value1 = pRight->u.iValue;
         nCond++;
-      } else if( pRight->op == TK_FLOAT ) {
+      }else if( pRight->op == TK_INTEGER ){
+        cond->value1 = pRight->u.iValue;
+        nCond++;
+      }else if( pRight->op == TK_FLOAT ){
         cond->value1 = (long long)sqlite3AtoF(pRight->u.zToken, 0, SQLITE_UTF8, 0);
+        nCond++;
+      }else if( pRight->op == TK_STRING && pRight->u.zToken ){
+        i64 tmpVal = 0;
+        sqlite3Atoi64(pRight->u.zToken, &tmpVal, SQLITE_UTF8, SQLITE_UTF8);
+        cond->value1 = tmpVal;
         nCond++;
       }
     }
@@ -7869,246 +7977,49 @@ static int extractWhereConditions(WhereInfo *pWInfo, GpuCondition *conditions, i
 
 SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
   int i;
-  int rc;
-  int col;
-  int res;
-  int actualRows;
-  int estimatedRows;
   int nConditions;
   int nColumns;
-  long long* tableData;
-  GpuWhereContext* gpuCtx;
   GpuCondition conditions[32];
   Table *pTab;
-  sqlite3 *db;
-  Schema *pSchema;
-  int iDb;
-  Btree *pBt;
-  BtCursor *pBtCur;
-  int iRoot;
+  GpuWhereContext* gpuCtx;
   
   if (!pWInfo || !pWInfo->bGpuScan) return 0;
   
+  pWInfo->pGpuRowids = NULL;
+  pWInfo->nGpuRowids = 0;
+  pWInfo->pGpuCtx = NULL;
 
   nConditions = extractWhereConditions(pWInfo, conditions, 32);
-  
+  if( nConditions == 0 ) return 0;
 
   pTab = pWInfo->pTabList->a[0].pSTab;
   nColumns = pTab->nCol + 1;  
-  
 
   gpuCtx = gpuWhereContextCreate(GPU_BATCH_SIZE, nColumns);
-  if (gpuCtx) {
+  if (!gpuCtx) return 0;
 
-    for(i = 0; i < nConditions; i++) {
-      gpuWhereContextAddCondition(gpuCtx, &conditions[i]);
+  for(i = 0; i < nConditions; i++) {
+    gpuWhereContextAddCondition(gpuCtx, &conditions[i]);
+  }
+
+  if( nConditions > 1 ) {
+    GpuCondition andCond;
+    for(i = 0; i < nConditions - 1; i++){
+      memset(&andCond, 0, sizeof(GpuCondition));
+      andCond.opCode = 6; 
+      andCond.leftChild = i == 0 ? 0 : nConditions + i - 1;
+      andCond.rightChild = i + 1;
+      andCond.columnIndex = -1;
+      gpuWhereContextAddCondition(gpuCtx, &andCond);
     }
-    
-
-    if( nConditions > 1 ) {
-      GpuCondition andCond;
-
-      for(i = 0; i < nConditions - 1; i++){
-        memset(&andCond, 0, sizeof(GpuCondition));
-        andCond.opCode = 6; 
-        andCond.leftChild = i == 0 ? 0 : nConditions + i - 1;
-        andCond.rightChild = i + 1;
-        andCond.columnIndex = -1;
-        gpuWhereContextAddCondition(gpuCtx, &andCond);
-      }
-
-      gpuWhereContextSetRootCondition(gpuCtx, nConditions + nConditions - 2);
-    } else if( nConditions == 1 ) {
-      gpuWhereContextSetRootCondition(gpuCtx, 0);
-    }
-    
-
-    estimatedRows = 0;
-    if( pTab->nRowLogEst > 0 ){
-      u64 tempRows = sqlite3LogEstToInt(pTab->nRowLogEst);
-      if( tempRows > GPU_BATCH_SIZE ) {
-        estimatedRows = GPU_BATCH_SIZE;
-      } else {
-        estimatedRows = (int)tempRows;
-      }
-    }
-    if( estimatedRows < 1000 ) estimatedRows = 100000;
-    
-    int rowReadLimit = GPU_BATCH_SIZE;
-
-    tableData = (long long*)malloc(GPU_BATCH_SIZE * nColumns * sizeof(long long));
-    if (!tableData) {
-      fprintf(stderr, "GPU: Failed to allocate %lld MB for table data\n", 
-              (long long)(GPU_BATCH_SIZE * nColumns * sizeof(long long)) / (1024*1024));
-      fflush(stderr);
-      gpuWhereContextDestroy(gpuCtx);
-      return 0;
-    }
-    
-
-    actualRows = 0;
-    
-
-    db = pWInfo->pParse->db;
-    pSchema = pTab->pSchema;
-    iDb = sqlite3SchemaToIndex(db, pSchema);
-    pBtCur = NULL;
-    
-    int totalProcessed = 0;
-    int totalMatches = 0;
-    
-    if( db && iDb >= 0 && actualRows < rowReadLimit ){
-
-      pBt = db->aDb[iDb].pBt;
-      iRoot = pTab->tnum; 
-      
-      if( pBt && iRoot > 0 ){
-
-        rc = sqlite3BtreeBeginTrans(pBt, 0, 0);
-        if( rc != SQLITE_OK ){
-          pBt = NULL;
-        }
-
-        pBtCur = pBt ? (BtCursor*)sqlite3MallocZero(sqlite3BtreeCursorSize()) : NULL;
-        if( pBtCur ){
-          rc = sqlite3BtreeCursor(pBt, iRoot, 0, 0, pBtCur);
-          
-          if( rc == SQLITE_OK ){
-
-            res = 0;
-            rc = sqlite3BtreeFirst(pBtCur, &res);
-            
-            while( rc == SQLITE_OK && res == 0 ){
-              actualRows = 0;  
-              
-
-              while( rc == SQLITE_OK && res == 0 && actualRows < rowReadLimit ){
-              i64 rowid;
-              u32 nPayload;
-              const u8 *aPayload;
-              u32 nLocal, offset;
-              u32 nHdr;
-              u32 idx;
-              u32 p1;
-              
-              /* Get the rowid first - this is the INTEGER PRIMARY KEY */
-              rowid = sqlite3BtreeIntegerKey(pBtCur);
-              
-
-              nPayload = sqlite3BtreePayloadSize(pBtCur);
-              aPayload = NULL;
-              
-              if( nPayload > 0 ){
-
-                aPayload = sqlite3BtreePayloadFetch(pBtCur, &nLocal);
-                
-                if( aPayload && nLocal >= nPayload ){
-
-                  tableData[actualRows * nColumns + 0] = rowid;
-                  
-
-                  idx = getVarint32(aPayload, nHdr);
-                  offset = nHdr;
-                  col = 1;
-                  
-
-                  p1 = idx;
-                  for(col = 1; col < nColumns && p1 < nHdr; col++){
-                    u32 serial_type;
-                    i64 value;
-                    int len;
-                    
-                    p1 += getVarint32(aPayload + p1, serial_type);
-                    
-
-                    value = 0;
-                    
-                    if( serial_type == 0 ){
-                      value = 0; /* NULL */
-                    } else if( serial_type == 1 ){
-                      value = (signed char)aPayload[offset];
-                      offset += 1;
-                    } else if( serial_type == 2 ){
-                      value = (aPayload[offset] << 8) | aPayload[offset+1];
-                      if( value & 0x8000 ) value -= 65536;
-                      offset += 2;
-                    } else if( serial_type == 3 ){
-                      value = (aPayload[offset] << 16) | (aPayload[offset+1] << 8) | aPayload[offset+2];
-                      if( value & 0x800000 ) value -= 16777216;
-                      offset += 3;
-                    } else if( serial_type == 4 ){
-                      value = (aPayload[offset] << 24) | (aPayload[offset+1] << 16) | 
-                              (aPayload[offset+2] << 8) | aPayload[offset+3];
-                      offset += 4;
-                    } else if( serial_type == 5 ){
-                      value = (((i64)aPayload[offset]) << 40) | (((i64)aPayload[offset+1]) << 32) |
-                              (((i64)aPayload[offset+2]) << 24) | (((i64)aPayload[offset+3]) << 16) |
-                              (((i64)aPayload[offset+4]) << 8) | aPayload[offset+5];
-                      if( value & 0x800000000000LL ) value -= 281474976710656LL;
-                      offset += 6;
-                    } else if( serial_type == 6 ){
-                      value = (((i64)aPayload[offset]) << 56) | (((i64)aPayload[offset+1]) << 48) |
-                              (((i64)aPayload[offset+2]) << 40) | (((i64)aPayload[offset+3]) << 32) |
-                              (((i64)aPayload[offset+4]) << 24) | (((i64)aPayload[offset+5]) << 16) |
-                              (((i64)aPayload[offset+6]) << 8) | aPayload[offset+7];
-                      offset += 8;
-                    } else if( serial_type == 8 ){
-                      value = 0;
-                    } else if( serial_type == 9 ){
-                      value = 1;
-                    } else {
-                      /*non-int type, skip */
-                      len = sqlite3VdbeSerialTypeLen(serial_type);
-                      offset += len;
-                      value = 0;
-                    }
-                    
-                    tableData[actualRows * nColumns + col] = value;
-                  }
-                  
-
-                  while( col < nColumns ){
-                    tableData[actualRows * nColumns + col] = 0;
-                    col++;
-                  }
-                  
-                  actualRows++;
-                }
-              }
-              
-
-              rc = sqlite3BtreeNext(pBtCur, 0);
-              }
-              
-              if (actualRows > 0) {
-                int nResults;
-                nResults = 0;
-                
-                if (gpuWhereContextSetData(gpuCtx, tableData, actualRows) == 0 &&
-                  gpuWhereContextCount(gpuCtx, &nResults) == 0) {
-                  totalProcessed += actualRows;
-                  totalMatches += nResults;
-                }
-              }
-            }
-          }
-          sqlite3BtreeCloseCursor(pBtCur);
-        }
-      }
-    }
-    
-    if (totalProcessed > 0) {
-      fprintf(stderr, "GPU: Processed %d total rows, found %d total matches\n", totalProcessed, totalMatches);
-      fflush(stderr);
-    } else {
-      fprintf(stderr, "GPU: No rows read from table\n");
-      fflush(stderr);
-    }
-    
-    free(tableData);
-    gpuWhereContextDestroy(gpuCtx);
+    gpuWhereContextSetRootCondition(gpuCtx, nConditions + nConditions - 2);
+  } else if( nConditions == 1 ) {
+    gpuWhereContextSetRootCondition(gpuCtx, 0);
   }
   
+
+  pWInfo->pGpuCtx = (void*)gpuCtx;
+
   return 0;
 }
 #endif 

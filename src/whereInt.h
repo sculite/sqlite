@@ -506,6 +506,11 @@ struct WhereInfo {
   WhereClause sWC;          /* Decomposition of the WHERE clause */
   WhereMaskSet sMaskSet;    /* Map cursor numbers to bitmasks */
   unsigned bGpuScan:1;     /* Bit Field to indicate if conservatively GPU elgigible for simplest WHERE scans */
+#ifdef SQLITE_ENABLE_GPU_SCAN
+  i64 *pGpuRowids;         
+  int nGpuRowids;         
+  void *pGpuCtx;           
+#endif
   WhereLevel a[FLEXARRAY];  /* Information about each nest loop in WHERE */
 };
 

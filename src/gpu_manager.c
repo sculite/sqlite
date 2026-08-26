@@ -24,6 +24,16 @@ extern int gpuWhereClauseCount(
     int numConditions,
     int rootConditionIndex
 );
+extern int gpuWhereClauseRowids(
+    const long long* h_data,
+    long long* h_outputRowids,
+    int* h_outputCount,
+    const GpuCondition* h_conditions,
+    int numRows,
+    int numColumns,
+    int numConditions,
+    int rootConditionIndex
+);
 
 static int g_gpuInitialized = 0;
 static int g_gpuAvailable = 0;
@@ -187,5 +197,27 @@ int gpuShouldUseGPU(int numRows, int numColumns, int numConditions) {
     if(numConditions <= 0 || numConditions > GPU_MAX_CONDITIONS) return 0;
     
     return 1;
+}
+
+int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* outputRows) {
+    if(!ctx || !outputRowids || !outputRows || ctx->numRows <= 0) return -1;
+
+    int resultCount = 0;
+    int result = gpuWhereClauseRowids(
+        ctx->dataBuffer,
+        ctx->outputBuffer,
+        &resultCount,
+        ctx->conditions,
+        ctx->numRows,
+        ctx->numColumns,
+        ctx->numConditions,
+        ctx->rootConditionIndex
+    );
+
+    if(result != 0) return -1;
+
+    *outputRowids = ctx->outputBuffer;
+    *outputRows = resultCount;
+    return 0;
 }
 //Yes no comments, I cant
