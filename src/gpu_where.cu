@@ -668,6 +668,114 @@ extern "C" int gpuWhereClauseCount(
 }
 
 
+
+//pipelined version of gpuWhereClauseCount
+//submit does HtoD, filter, and count 
+//collect doesDtoH of count result
+extern "C" int gpuWhereClauseCountSubmit(
+    const long long* h_data,
+    const Condition* h_conditions,
+    int numRows,
+    int numColumns,
+    int numConditions,
+    int rootConditionIndex
+){
+    if(!g_gpuInitialized) {
+        fprintf(stderr, "GPU: Not initialized\n");
+        return -1;
+    }
+    if(!h_data || numRows <= 0) {
+        return -1;
+    }
+
+    cudaError_t err = cudaSuccess;
+    size_t dataSize = (size_t)numRows * (size_t)numColumns * sizeof(long long);
+    size_t maskSize = (size_t)numRows * sizeof(int);
+    size_t condSize = (size_t)numConditions * sizeof(Condition);
+    size_t blockSumsSize = ((numRows + BLOCK_SIZE - 1) / BLOCK_SIZE) * sizeof(int);
+
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_data, dataSize, &g_deviceScratch.dataCapacity, "device data") != 0) {
+        return -1;
+    }
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_resultMask, maskSize, &g_deviceScratch.maskCapacity, "device result mask") != 0) {
+        return -1;
+    }
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_matchCount, sizeof(int), &g_deviceScratch.matchCountCapacity, "device match count") != 0) {
+        return -1;
+    }
+    if(numConditions > 0) {
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_conditions, condSize, &g_deviceScratch.conditionCapacity, "device conditions") != 0) {
+            return -1;
+        }
+    }
+
+    /* Wait for previous batch's kernel to finish before overwriting the
+    ** shared device data buffer. This serializes GPU kernels across batches
+    ** while still allowing the CPU to fill the next host buffer in parallel. */
+    err = cudaStreamSynchronize(g_deviceScratch.computeStream);
+    if(err != cudaSuccess) return -1;
+
+    /* Async H2D transfer of row data */
+    err = cudaMemcpyAsync(g_deviceScratch.d_data, h_data, dataSize,
+                          cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
+    if(err != cudaSuccess) return -1;
+
+    /* Async H2D transfer of conditions */
+    if(numConditions > 0) {
+        err = cudaMemcpyAsync(g_deviceScratch.d_conditions, h_conditions, condSize,
+                              cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
+        if(err != cudaSuccess) return -1;
+    }
+
+    /* Wait for H2D transfers to complete before launching kernel */
+    err = cudaStreamSynchronize(g_deviceScratch.transferStream);
+    if(err != cudaSuccess) return -1;
+
+    /* Launch filter kernel on compute stream */
+    int numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    whereClauseKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
+        g_deviceScratch.d_data,
+        g_deviceScratch.d_resultMask,
+        g_deviceScratch.d_conditions,
+        numRows,
+        numColumns,
+        rootConditionIndex
+    );
+    if(cudaGetLastError() != cudaSuccess) return -1;
+
+    /* Zero match count */
+    err = cudaMemsetAsync(g_deviceScratch.d_matchCount, 0, sizeof(int), g_deviceScratch.computeStream);
+    if(err != cudaSuccess) return -1;
+
+    /* Launch count kernel on compute stream */
+    countMatchesKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
+        g_deviceScratch.d_resultMask,
+        g_deviceScratch.d_matchCount,
+        numRows
+    );
+    if(cudaGetLastError() != cudaSuccess) return -1;
+
+    /* Kernel launched asynchronously — return without waiting */
+    return 0;
+}
+
+extern "C" int gpuWhereClauseCountCollect(int* h_outputCount) {
+    if(!h_outputCount) return -1;
+
+    /* D2H transfer of count (tiny, 4 bytes) */
+    cudaError_t err = cudaMemcpyAsync(h_outputCount, g_deviceScratch.d_matchCount,
+                                       sizeof(int), cudaMemcpyDeviceToHost,
+                                       g_deviceScratch.computeStream);
+    if(err != cudaSuccess) return -1;
+
+    /* Block until count is available */
+    err = cudaStreamSynchronize(g_deviceScratch.computeStream);
+    if(err != cudaSuccess) return -1;
+
+    return 0;
+}
+
+
 __global__ void compactRowidsKernel(
     const long long* inputData,
     long long* outputRowids,

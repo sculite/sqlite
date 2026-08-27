@@ -9149,6 +9149,20 @@ case OP_GpuScan: {
         int scanRes = 0;
         rc2 = sqlite3BtreeFirst(pBtCur, &scanRes);
         
+
+        //ping pong buffer ishere
+        //tableDataA and tableDataB are the two buffers
+        //this basically overlaps btree read(cpu bound) with gpu kernel hiding the time latency
+        long long *tableDataA = tableData;
+        long long *tableDataB = NULL;
+        if( pIter->isAggregateOnly ){
+          tableDataB = (long long*)sqlite3DbMallocRaw(db,
+              (u64)GPU_BATCH_SIZE * (u64)nColumns * sizeof(long long));
+        }
+        long long *curBuf = tableDataA;
+        long long *nxtBuf = pIter->isAggregateOnly ? tableDataB : NULL;
+        int hasPending = 0;     
+        
         while( rc2 == SQLITE_OK && scanRes == 0 ){
           actualRows = 0;
           while( rc2 == SQLITE_OK && scanRes == 0
@@ -9158,8 +9172,7 @@ case OP_GpuScan: {
             const u8 *aPayload;
             u32 nLocal, offset;
             u32 nHdr;
-            u32 idx;
-            u32 p1;
+            u32 idx, p1;
             int col;
             
             curRowid = sqlite3BtreeIntegerKey(pBtCur);
@@ -9169,7 +9182,7 @@ case OP_GpuScan: {
             if( nPayload > 0 ){
               aPayload = sqlite3BtreePayloadFetch(pBtCur, &nLocal);
               if( aPayload && nLocal >= nPayload ){
-                tableData[actualRows * nColumns + 0] = curRowid;
+                curBuf[actualRows * nColumns + 0] = curRowid;
 
                 idx = getVarint32(aPayload, nHdr);
                 offset = nHdr;
@@ -9221,10 +9234,10 @@ case OP_GpuScan: {
                     value = 0;
                   }
                   
-                  tableData[actualRows * nColumns + col] = value;
+                  curBuf[actualRows * nColumns + col] = value;
                 }
                 while( col < nColumns ){
-                  tableData[actualRows * nColumns + col] = 0;
+                  curBuf[actualRows * nColumns + col] = 0;
                   col++;
                 }
                 actualRows++;
@@ -9235,21 +9248,32 @@ case OP_GpuScan: {
           
           if( actualRows > 0 ){
             if( pIter->isAggregateOnly ){
-              int setDataRc2 = gpuWhereContextSetData(gpuCtx, tableData, actualRows);
-              if( setDataRc2 == 0 ){
-                if( aggFirstRowid < 0 ){
-                  long long *batchRowids = NULL;
-                  int batchCount = 0;
-                  if( gpuWhereContextRowids(gpuCtx, &batchRowids, &batchCount)==0 ){
-                    pIter->aggregateCount += batchCount;
-                    if( batchCount > 0 ){
-                      aggFirstRowid = batchRowids[0];
-                    }
+              if( aggFirstRowid < 0 ){
+
+                long long *batchRowids = NULL;
+                int batchCount = 0;
+                gpuWhereContextSetData(gpuCtx, curBuf, actualRows);
+                if( gpuWhereContextRowids(gpuCtx, &batchRowids, &batchCount)==0 ){
+                  pIter->aggregateCount += batchCount;
+                  if( batchCount > 0 ){
+                    aggFirstRowid = batchRowids[0];
                   }
+                }
+              }else{
+                if( hasPending ){
+                  int c = 0;
+                  if( gpuWhereContextCollectCount(&c)==0 ){
+                    pIter->aggregateCount += c;
+                  }
+                  hasPending = 0;
+                }
+
+                if( gpuWhereContextSubmitCount(gpuCtx, curBuf, actualRows)==0 ){
+                  hasPending = 1;
                 }else{
-                  int batchCount = 0;
-                  if( gpuWhereContextCount(gpuCtx, &batchCount)==0 ){
-                    pIter->aggregateCount += batchCount;
+                  int c = 0;
+                  if( gpuWhereContextCount(gpuCtx, &c)==0 ){
+                    pIter->aggregateCount += c;
                   }
                 }
               }
@@ -9257,7 +9281,7 @@ case OP_GpuScan: {
               long long *batchRowids = NULL;
               int batchCount = 0;
               int setDataRc, getRowidsRc;
-              setDataRc = gpuWhereContextSetData(gpuCtx, tableData, actualRows);
+              setDataRc = gpuWhereContextSetData(gpuCtx, curBuf, actualRows);
               if( setDataRc == 0 ){
                 getRowidsRc = gpuWhereContextRowids(gpuCtx, &batchRowids, &batchCount);
                 if( getRowidsRc == 0 && batchCount > 0 ){
@@ -9282,6 +9306,24 @@ case OP_GpuScan: {
               }
             }
           }
+          
+
+          if( pIter->isAggregateOnly && nxtBuf ){
+            long long *tmp = curBuf;
+            curBuf = nxtBuf;
+            nxtBuf = tmp;
+          }
+        }
+        
+        if( hasPending ){
+          int c = 0;
+          if( gpuWhereContextCollectCount(&c)==0 ){
+            pIter->aggregateCount += c;
+          }
+          hasPending = 0;
+        }
+        if( tableDataB ){
+          sqlite3DbFree(db, tableDataB);
         }
         sqlite3BtreeCloseCursor(pBtCur);
       }else{

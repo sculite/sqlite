@@ -1,0 +1,72 @@
+500000000
+============ IN-MEMORY 500M ALL TESTS ============
+
+S1: age = 30
+8333334
+Run Time: real 11.142741 user 9.282559 sys 1.867170
+
+S2: score > 50
+245000000
+Run Time: real 9.524892 user 9.236846 sys 0.299263
+
+S3: age >= 25 AND score <= 75
+348333331
+Run Time: real 9.504666 user 9.241918 sys 0.273891
+
+S4: age > 30 AND score < 80 AND category = 5
+33333333
+Run Time: real 9.507536 user 9.249919 sys 0.268704
+
+S5: value >= 1000 AND value < 5000
+200000000
+Run Time: real 9.595544 user 9.328908 sys 0.278096
+
+E1: age > 999
+0
+Run Time: real 10.834402 user 10.551368 sys 0.295705
+
+E2: age >= 0
+500000000
+Run Time: real 9.573321 user 9.273554 sys 0.311112
+
+E3: value = 0
+50000
+Run Time: real 9.515008 user 9.262222 sys 0.262199
+
+E4: value = 9999
+50000
+Run Time: real 9.491716 user 9.229652 sys 0.273140
+
+E5: age < 30
+83333339
+Run Time: real 9.501329 user 9.224404 sys 0.288196
+
+E6: age <= 29
+83333339
+Run Time: real 9.483864 user 9.222613 sys 0.272114
+
+E7: age <= 30
+91666673
+Run Time: real 9.499793 user 9.242464 sys 0.267964
+
+E8: score = 0
+5000000
+Run Time: real 9.485523 user 9.225441 sys 0.271083
+
+E9: score > 99
+0
+Run Time: real 10.762661 user 10.505217 sys 0.270051
+
+E10: category = 7
+50000000
+Run Time: real 9.498251 user 9.229453 sys 0.279911
+
+E11: age = 30 AND score = 30
+1666667
+Run Time: real 9.578714 user 9.311945 sys 0.278101
+
+E12: 6 conditions
+500000000
+Run Time: real 9.859436 user 9.554612 sys 0.316011
+
+Done!

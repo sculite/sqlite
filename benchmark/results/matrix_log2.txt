@@ -1,0 +1,73 @@
+[29s wall, 29s] 50m_disk_cpu rc=0 ntimes=17 ok=True
+[60s wall, 31s] 50m_disk_nopipe rc=0 ntimes=17 ok=True
+[86s wall, 26s] 50m_disk_pipe5 rc=0 ntimes=17 ok=True
+[119s wall, 33s] 50m_disk_pipe10 rc=0 ntimes=17 ok=True
+[164s wall, 45s] 50m_disk_pipe20 rc=0 ntimes=17 ok=True
+[166s wall, 2s] 50m_disk_pipe50 rc=1 ntimes=17 ok=False
+    tail: mory | Error near line 79: out of memory | Error near line 86: out of memory | Error near line 93: out of memory | Error near line 100: out of memory | Error near line 107: out of memory | Error near line 114: out of memory | Error near line 121: out of memory | Error near line 128: out of memory | 
+[199s wall, 32s] 50m_mem_cpu rc=0 ntimes=17 ok=True
+[233s wall, 34s] 50m_mem_nopipe rc=0 ntimes=17 ok=True
+[263s wall, 30s] 50m_mem_pipe5 rc=0 ntimes=17 ok=True
+[299s wall, 36s] 50m_mem_pipe10 rc=0 ntimes=17 ok=True
+[348s wall, 49s] 50m_mem_pipe20 rc=0 ntimes=17 ok=True
+[356s wall, 9s] 50m_mem_pipe50 rc=1 ntimes=17 ok=False
+    tail: of memory | Error near line 54: out of memory | Error near line 59: out of memory | Error near line 64: out of memory | Error near line 69: out of memory | Error near line 74: out of memory | Error near line 79: out of memory | Error near line 84: out of memory | Error near line 89: out of memory | 
+[416s wall, 59s] 100m_disk_cpu rc=0 ntimes=17 ok=True
+[466s wall, 50s] 100m_disk_nopipe rc=0 ntimes=17 ok=True
+[511s wall, 45s] 100m_disk_pipe5 rc=0 ntimes=17 ok=True
+[561s wall, 50s] 100m_disk_pipe10 rc=0 ntimes=17 ok=True
+[624s wall, 63s] 100m_disk_pipe20 rc=0 ntimes=17 ok=True
+[626s wall, 2s] 100m_disk_pipe50 rc=1 ntimes=17 ok=False
+    tail: mory | Error near line 79: out of memory | Error near line 86: out of memory | Error near line 93: out of memory | Error near line 100: out of memory | Error near line 107: out of memory | Error near line 114: out of memory | Error near line 121: out of memory | Error near line 128: out of memory | 
+[690s wall, 64s] 100m_mem_cpu rc=0 ntimes=17 ok=True
+[748s wall, 58s] 100m_mem_nopipe rc=0 ntimes=17 ok=True
+[801s wall, 53s] 100m_mem_pipe5 rc=0 ntimes=17 ok=True
+[859s wall, 58s] 100m_mem_pipe10 rc=0 ntimes=17 ok=True
+[929s wall, 71s] 100m_mem_pipe20 rc=0 ntimes=17 ok=True
+[944s wall, 15s] 100m_mem_pipe50 rc=1 ntimes=17 ok=False
+    tail: of memory | Error near line 54: out of memory | Error near line 59: out of memory | Error near line 64: out of memory | Error near line 69: out of memory | Error near line 74: out of memory | Error near line 79: out of memory | Error near line 84: out of memory | Error near line 89: out of memory | 
+[1092s wall, 148s] 250m_disk_cpu rc=0 ntimes=17 ok=True
+[1203s wall, 110s] 250m_disk_nopipe rc=0 ntimes=17 ok=True
+[1302s wall, 99s] 250m_disk_pipe5 rc=0 ntimes=17 ok=True
+[1406s wall, 104s] 250m_disk_pipe10 rc=0 ntimes=17 ok=True
+[1523s wall, 117s] 250m_disk_pipe20 rc=0 ntimes=17 ok=True
+[1526s wall, 3s] 250m_disk_pipe50 rc=1 ntimes=17 ok=False
+    tail: mory | Error near line 79: out of memory | Error near line 86: out of memory | Error near line 93: out of memory | Error near line 100: out of memory | Error near line 107: out of memory | Error near line 114: out of memory | Error near line 121: out of memory | Error near line 128: out of memory | 
+[1686s wall, 160s] 250m_mem_cpu rc=0 ntimes=17 ok=True
+[1817s wall, 131s] 250m_mem_nopipe rc=0 ntimes=17 ok=True
+[1935s wall, 119s] 250m_mem_pipe5 rc=0 ntimes=17 ok=True
+[2061s wall, 126s] 250m_mem_pipe10 rc=0 ntimes=17 ok=True
+[2198s wall, 137s] 250m_mem_pipe20 rc=0 ntimes=17 ok=True
+[2234s wall, 35s] 250m_mem_pipe50 rc=1 ntimes=17 ok=False
+    tail: of memory | Error near line 54: out of memory | Error near line 59: out of memory | Error near line 64: out of memory | Error near line 69: out of memory | Error near line 74: out of memory | Error near line 79: out of memory | Error near line 84: out of memory | Error near line 89: out of memory | 
+[2520s wall, 287s] 500m_disk_cpu rc=0 ntimes=17 ok=True
+[2735s wall, 215s] 500m_disk_nopipe rc=0 ntimes=17 ok=True
+[2928s wall, 193s] 500m_disk_pipe5 rc=0 ntimes=17 ok=True
+[3126s wall, 198s] 500m_disk_pipe10 rc=0 ntimes=17 ok=True
+[3336s wall, 210s] 500m_disk_pipe20 rc=0 ntimes=17 ok=True
+[3340s wall, 4s] 500m_disk_pipe50 rc=1 ntimes=17 ok=False
+    tail: mory | Error near line 79: out of memory | Error near line 86: out of memory | Error near line 93: out of memory | Error near line 100: out of memory | Error near line 107: out of memory | Error near line 114: out of memory | Error near line 121: out of memory | Error near line 128: out of memory | 
+[3662s wall, 322s] 500m_mem_cpu rc=0 ntimes=17 ok=True
+[3917s wall, 254s] 500m_mem_nopipe rc=0 ntimes=17 ok=True
+[4150s wall, 233s] 500m_mem_pipe5 rc=0 ntimes=17 ok=True
+[4394s wall, 244s] 500m_mem_pipe10 rc=0 ntimes=17 ok=True
+[4645s wall, 251s] 500m_mem_pipe20 rc=0 ntimes=17 ok=True
+[4715s wall, 70s] 500m_mem_pipe50 rc=1 ntimes=17 ok=False
+    tail: of memory | Error near line 54: out of memory | Error near line 59: out of memory | Error near line 64: out of memory | Error near line 69: out of memory | Error near line 74: out of memory | Error near line 79: out of memory | Error near line 84: out of memory | Error near line 89: out of memory | 
+[5171s wall, 456s] 750m_disk_cpu rc=0 ntimes=17 ok=True
+[5484s wall, 313s] 750m_disk_nopipe rc=0 ntimes=17 ok=True
+[5766s wall, 282s] 750m_disk_pipe5 rc=0 ntimes=17 ok=True
+[6055s wall, 289s] 750m_disk_pipe10 rc=0 ntimes=17 ok=True
+[6354s wall, 299s] 750m_disk_pipe20 rc=0 ntimes=17 ok=True
+[6359s wall, 5s] 750m_disk_pipe50 rc=1 ntimes=17 ok=False
+    tail: mory | Error near line 79: out of memory | Error near line 86: out of memory | Error near line 93: out of memory | Error near line 100: out of memory | Error near line 107: out of memory | Error near line 114: out of memory | Error near line 121: out of memory | Error near line 128: out of memory | 
+[6850s wall, 491s] 750m_mem_cpu rc=0 ntimes=17 ok=True
+[7235s wall, 385s] 750m_mem_nopipe rc=0 ntimes=17 ok=True
+[7589s wall, 354s] 750m_mem_pipe5 rc=0 ntimes=17 ok=True
+[7945s wall, 356s] 750m_mem_pipe10 rc=0 ntimes=17 ok=True
+[8313s wall, 368s] 750m_mem_pipe20 rc=0 ntimes=17 ok=True
+[8419s wall, 105s] 750m_mem_pipe50 rc=1 ntimes=17 ok=False
+    tail: of memory | Error near line 54: out of memory | Error near line 59: out of memory | Error near line 64: out of memory | Error near line 69: out of memory | Error near line 74: out of memory | Error near line 79: out of memory | Error near line 84: out of memory | Error near line 89: out of memory | 
+ALL DONE
+results.json written
+EXIT False

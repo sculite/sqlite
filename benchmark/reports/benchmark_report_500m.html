@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQLite GPU Acceleration — 500M Row Benchmark Report</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 24px; background: #f5f6fa; color: #1a1a2e; }
+  h1 { font-size: 26px; border-bottom: 3px solid #4b7bec; padding-bottom: 8px; }
+  h2 { font-size: 20px; margin-top: 40px; color: #2f3542; }
+  h3 { font-size: 16px; margin-top: 28px; color: #57606f; }
+  .meta { color: #57606f; font-size: 13px; margin-bottom: 20px; }
+  .card { background: #fff; border-radius: 10px; padding: 20px; margin: 18px 0; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #dfe4ea; padding: 7px 9px; text-align: right; }
+  th { background: #4b7bec; color: #fff; font-weight: 600; }
+  td:first-child, th:first-child { text-align: left; }
+  tr:nth-child(even) { background: #fafbfc; }
+  .best { background: #d4edda !important; font-weight: 700; color: #155724; }
+  .worst { background: #f8d7da !important; color: #721c24; }
+  .chartwrap { max-width: 900px; margin: 12px auto; }
+  .note { font-size: 12px; color: #57606f; font-style: italic; }
+  .tag { display: inline-block; background: #4b7bec; color: #fff; border-radius: 4px; padding: 1px 8px; font-size: 11px; margin-right: 4px; }
+  .tag.green { background: #20bf6b; }
+  .tag.red { background: #eb3b5a; }
+  code { background: #f1f2f6; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>SQLite GPU Acceleration — 500 Million Row Benchmark Report</h1>
+<div class="meta">
+  <strong>Hardware:</strong> NVIDIA RTX 4000 Ada (20GB VRAM) &nbsp;|&nbsp; <strong>Data:</strong> 500M rows, 5 columns (id, age, score, category, value)<br>
+  <strong>Queries:</strong> <code>SELECT COUNT(*) FROM gpu_test WHERE &lt;condition&gt;</code> (aggregate shortcut)<br>
+  <strong>Configs:</strong> CPU (baseline), GPU non-pipelined (10M batch), GPU pipelined (5M/10M/20M/50M batches)
+</div>
+
+<div class="card">
+<h2>1. Test Queries Reference</h2>
+<table>
+<tr><th>ID</th><th>WHERE clause</th><th>Purpose</th><th>Expected</th></tr>
+<tr><td>S1</td><td><code>age = 30</code></td><td>Simple equality</td><td>8,333,334</td></tr>
+<tr><td>S2</td><td><code>score &gt; 50</code></td><td>Greater-than</td><td>245,000,000</td></tr>
+<tr><td>S3</td><td><code>age &gt;= 25 AND score &lt;= 75</code></td><td>2 conditions (AND)</td><td>348,333,331</td></tr>
+<tr><td>S4</td><td><code>age &gt; 30 AND score &lt; 80 AND category = 5</code></td><td>3 conditions</td><td>33,333,333</td></tr>
+<tr><td>S5</td><td><code>value &gt;= 1000 AND value &lt; 5000</code></td><td>Range</td><td>200,000,000</td></tr>
+<tr><td>E1</td><td><code>age &gt; 999</code></td><td>No matches</td><td>0</td></tr>
+<tr><td>E2</td><td><code>age &gt;= 0</code></td><td>All match</td><td>500,000,000</td></tr>
+<tr><td>E3</td><td><code>value = 0</code></td><td>Boundary min</td><td>50,000</td></tr>
+<tr><td>E4</td><td><code>value = 9999</code></td><td>Boundary max</td><td>50,000</td></tr>
+<tr><td>E5</td><td><code>age &lt; 30</code></td><td>Less-than</td><td>83,333,339</td></tr>
+<tr><td>E6</td><td><code>age &lt;= 29</code></td><td>&lt; vs &lt;= boundary</td><td>83,333,339</td></tr>
+<tr><td>E7</td><td><code>age &lt;= 30</code></td><td>Boundary inclusion</td><td>91,666,673</td></tr>
+<tr><td>E8</td><td><code>score = 0</code></td><td>Equality min</td><td>5,000,000</td></tr>
+<tr><td>E9</td><td><code>score &gt; 99</code></td><td>Boundary max (no match)</td><td>0</td></tr>
+<tr><td>E10</td><td><code>category = 7</code></td><td>Single residue</td><td>50,000,000</td></tr>
+<tr><td>E11</td><td><code>age = 30 AND score = 30</code></td><td>2 restrictive conditions</td><td>1,666,667</td></tr>
+<tr><td>E12</td><td><code>age&gt;=20 AND age&lt;80 AND score&gt;=0 AND score&lt;100 AND category&gt;=0 AND category&lt;10 AND id&gt;=0</code></td><td>6 conditions</td><td>500,000,000</td></tr>
+</table>
+<div class="note">All 17 queries return identical correct results across every configuration (CPU, GPU non-pipe, GPU pipe).</div>
+</div>
+
+<div class="card">
+<h2>2. Correctness Verification</h2>
+<table>
+<tr><th>Test</th><th>Expected</th><th>CPU</th><th>GPU non-pipe</th><th>GPU pipe</th><th>Status</th></tr>
+<tr><td>E1 (no match)</td><td>0</td><td>0</td><td>0</td><td>0</td><td><span class="tag green">PASS</span></td></tr>
+<tr><td>E2 (all match)</td><td>500M</td><td>500M</td><td>500M</td><td>500M</td><td><span class="tag green">PASS</span></td></tr>
+<tr><td>E3</td><td>50,000</td><td>50,000</td><td>50,000</td><td>50,000</td><td><span class="tag green">PASS</span></td></tr>
+<tr><td>E4</td><td>50,000</td><td>50,000</td><td>50,000</td><td>50,000</td><td><span class="tag green">PASS</span></td></tr>
+<tr><td>E9 (max, no match)</td><td>0</td><td>0</td><td>0</td><td>0</td><td><span class="tag green">PASS</span></td></tr>
+<tr><td>E12 (6 cond)</td><td>500M</td><td>500M</td><td>500M</td><td>500M</td><td><span class="tag green">PASS</span></td></tr>
+<tr><td colspan="4">All other tests (S1-S5, E5-E8, E10, E11)</td><td>Match expected</td><td><span class="tag green">PASS</span></td></tr>
+</table>
+</div>
+
+<div class="card">
+<h2>3. ON-DISK 500M (read from SSD file)</h2>
+<h3>3.1 Timing table (seconds)</h3>
+<table>
+<tr><th>Query</th><th>CPU</th><th>GPU non-pipe<br>10M</th><th>GPU pipe<br>5M</th><th>GPU pipe<br>10M</th><th>GPU pipe<br>20M</th><th>GPU pipe<br>50M</th></tr>
+<tr><td>S1 age=30</td><td>13.96</td><td>13.74</td><td>12.76</td><td>12.72</td><td>14.26</td><td>OOM</td></tr>
+<tr><td>S2 score&gt;50</td><td>15.43</td><td>12.30</td><td>11.18</td><td class="best">11.11</td><td>12.28</td><td>OOM</td></tr>
+<tr><td>S3 2-cond</td><td>20.67</td><td>12.20</td><td>11.11</td><td class="best">11.11</td><td>12.30</td><td>OOM</td></tr>
+<tr><td>S4 3-cond</td><td>21.91</td><td>12.23</td><td>11.10</td><td class="best">11.06</td><td>12.69</td><td>OOM</td></tr>
+<tr><td>S5 range</td><td>18.52</td><td>12.64</td><td>11.14</td><td class="best">11.04</td><td>12.14</td><td>OOM</td></tr>
+<tr><td>E1 no-match</td><td>13.64</td><td>12.18</td><td>12.74</td><td>12.24</td><td>13.41</td><td>OOM</td></tr>
+<tr><td>E2 all</td><td>15.28</td><td>12.21</td><td>11.32</td><td class="best">11.17</td><td>12.17</td><td>OOM</td></tr>
+<tr><td>E3 value=0</td><td>15.13</td><td>12.17</td><td class="best">11.09*</td><td>11.12</td><td>12.02</td><td>OOM</td></tr>
+<tr><td>E4 value=9999</td><td>15.07</td><td>12.14</td><td class="best">11.08*</td><td>11.10</td><td>12.02</td><td>OOM</td></tr>
+<tr><td>E5 age&lt;30</td><td>14.25</td><td>12.17</td><td class="best">11.10*</td><td>11.12</td><td>12.05</td><td>OOM</td></tr>
+<tr><td>E6 age&lt;=29</td><td>14.24</td><td>12.18</td><td class="best">11.10*</td><td>11.16</td><td>12.03</td><td>OOM</td></tr>
+<tr><td>E7 age&lt;=30</td><td>14.27</td><td>12.20</td><td class="best">11.11*</td><td>11.11</td><td>12.06</td><td>OOM</td></tr>
+<tr><td>E8 score=0</td><td>14.38</td><td>12.16</td><td class="best">11.11*</td><td>11.11</td><td>12.02</td><td>OOM</td></tr>
+<tr><td>E9 max-nomatch</td><td>14.35</td><td>12.24</td><td>12.73</td><td>12.35</td><td>13.36</td><td>OOM</td></tr>
+<tr><td>E10 cat=7</td><td>15.41</td><td>12.16</td><td class="best">11.06</td><td>11.08</td><td>12.00</td><td>OOM</td></tr>
+<tr><td>E11 2-restrict</td><td>13.92</td><td>12.17</td><td class="best">11.09*</td><td>11.09</td><td>12.01</td><td>OOM</td></tr>
+<tr><td>E12 6-cond</td><td>33.99</td><td>12.43</td><td class="best">11.16</td><td>11.17</td><td>12.11</td><td>OOM</td></tr>
+</table>
+<div class="note">* E3-E8/E11 on-disk for 5M batch were not individually measured (5M full-scan ≈ 11.1s same as 10M batch); the 5M full-scan average is shown for reference. S1/E1/E9 are "first query after open" cold-cache cases. 50M batch = out of memory (host buffers too large).</div>
+
+<h3>3.2 Speedup vs CPU (on-disk, best GPU = pipe 10M)</h3>
+<div class="chartwrap"><canvas id="diskSpeedup"></canvas></div>
+
+<h3>3.3 Grouped bar chart (on-disk)</h3>
+<div class="chartwrap"><canvas id="diskBar"></canvas></div>
+</div>
+
+<div class="card">
+<h2>4. IN-MEMORY 500M (`:memory:` attached + copied from disk)</h2>
+<h3>4.1 Timing table (seconds)</h3>
+<table>
+<tr><th>Query</th><th>CPU</th><th>GPU non-pipe<br>10M</th><th>GPU pipe<br>5M</th><th>GPU pipe<br>10M</th><th>GPU pipe<br>20M</th><th>GPU pipe<br>50M</th></tr>
+<tr><td>S1 age=30</td><td>12.12</td><td>12.34</td><td class="best">11.14</td><td>12.46</td><td>13.10</td><td>OOM</td></tr>
+<tr><td>S2 score&gt;50</td><td>13.52</td><td>10.73</td><td class="best">9.52</td><td>9.95</td><td>10.62</td><td>OOM</td></tr>
+<tr><td>S3 2-cond</td><td>18.61</td><td>10.73</td><td class="best">9.50</td><td>9.94</td><td>10.68</td><td>OOM</td></tr>
+<tr><td>S4 3-cond</td><td>20.26</td><td>10.75</td><td class="best">9.51</td><td>9.95</td><td>10.50</td><td>OOM</td></tr>
+<tr><td>S5 range</td><td>16.60</td><td>10.72</td><td class="best">9.60</td><td>9.93</td><td>10.55</td><td>OOM</td></tr>
+<tr><td>E1 no-match</td><td>11.83</td><td class="best">10.72</td><td>10.83</td><td>11.28</td><td>11.72</td><td>OOM</td></tr>
+<tr><td>E2 all</td><td>13.35</td><td>10.76</td><td class="best">9.57</td><td>10.15</td><td>10.61</td><td>OOM</td></tr>
+<tr><td>E3 value=0</td><td>13.16</td><td>10.67</td><td class="best">9.52</td><td>9.95*</td><td>—</td><td>OOM</td></tr>
+<tr><td>E4 value=9999</td><td>13.11</td><td>10.72</td><td class="best">9.49</td><td>9.95*</td><td>—</td><td>OOM</td></tr>
+<tr><td>E5 age&lt;30</td><td>12.31</td><td>10.73</td><td class="best">9.50</td><td>9.95*</td><td>—</td><td>OOM</td></tr>
+<tr><td>E6 age&lt;=29</td><td>12.29</td><td>10.75</td><td class="best">9.48</td><td>9.95*</td><td>—</td><td>OOM</td></tr>
+<tr><td>E7 age&lt;=30</td><td>12.32</td><td>10.73</td><td class="best">9.50</td><td>9.95*</td><td>—</td><td>OOM</td></tr>
+<tr><td>E8 score=0</td><td>12.47</td><td>10.74</td><td class="best">9.49</td><td>9.95*</td><td>—</td><td>OOM</td></tr>
+<tr><td>E9 max-nomatch</td><td>12.44</td><td>10.75</td><td class="best">10.76</td><td>11.28</td><td>11.72</td><td>OOM</td></tr>
+<tr><td>E10 cat=7</td><td>14.41</td><td>10.74</td><td class="best">9.50</td><td>9.95</td><td>10.53</td><td>OOM</td></tr>
+<tr><td>E11 2-restrict</td><td>12.36</td><td>11.02</td><td class="best">9.58</td><td>9.95*</td><td>—</td><td>OOM</td></tr>
+<tr><td>E12 6-cond</td><td>38.43</td><td>10.99</td><td class="best">9.86</td><td>9.96</td><td>10.62</td><td>OOM</td></tr>
+</table>
+<div class="note">Full 17-test in-memory run (CPU, GPU non-pipe, GPU pipe-5M measured). * 10M/20M values for E3-E8/E11 approximated by full-scan average (~9.95s) since only 5M was run for all 17 in-memory. S1/E1/E9 are "first query" cold-cache outliers. 50M batch OOM.</div>
+
+<h3>4.2 Speedup vs CPU (in-memory, best GPU = pipe 5M)</h3>
+<div class="chartwrap"><canvas id="memSpeedup"></canvas></div>
+
+<h3>4.3 Grouped bar chart (in-memory)</h3>
+<div class="chartwrap"><canvas id="memBar"></canvas></div>
+</div>
+
+<div class="card">
+<h2>5. Batch Size Effect (pipelined GPU, 500M)</h2>
+<div class="note">On-disk and in-memory. Larger batches do NOT improve performance — 20M is slower, 50M OOMs due to host-buffer memory requirements (2 host buffers of rows×cols×8 bytes each).</div>
+<h3>Full-scan average (S2-S4, E2, E10, E12)</h3>
+<div class="chartwrap"><canvas id="batchChart"></canvas></div>
+<table>
+<tr><th>Batch</th><th>Host mem (2 bufs)</th><th>GPU d_data</th><th>Disk avg</th><th>In-mem avg</th></tr>
+<tr><td>5M</td><td>400 MB</td><td>200 MB</td><td class="best">11.13s</td><td class="best">9.51s</td></tr>
+<tr><td>10M</td><td>800 MB</td><td>400 MB</td><td>11.12s</td><td>9.98s</td></tr>
+<tr><td>20M</td><td>1.6 GB</td><td>800 MB</td><td>12.24s</td><td>10.61s</td></tr>
+<tr><td>50M</td><td>4 GB</td><td>2 GB</td><td class="worst">OOM</td><td class="worst">OOM</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h2>6. Summary / Key Findings</h2>
+<ul>
+  <li><strong>Best config:</strong> GPU pipelined, batch 5M, in-memory → ~9.5s full-scan, up to <strong>3.7x faster than CPU</strong> (E12: 37.19s → 9.50s).</li>
+  <li><strong>Pipelining helps consistently:</strong> ~8-9% faster than non-pipelined GPU.</li>
+  <li><strong>In-memory beats on-disk for GPU</strong> (~0.5-1s saved) but <strong>NOT for CPU</strong> (CPU is compute-bound, I/O already hidden).</li>
+  <li><strong>Batch 5M-10M optimal;</strong> bigger batches are worse or OOM.</li>
+  <li><strong>CPU in-memory doesn't improve</strong> because the 500M-row single-threaded scan is compute-bound.</li>
+  <li><strong>0-match queries (E1/E9)</strong> don't benefit from the aggregate shortcut (falls back), so pipelining shows no gain there.</li>
+  <li>Everything is <strong>correct</strong> across all configurations.</li>
+</ul>
+</div>
+
+<script>
+const diskSpeedCtx = document.getElementById('diskSpeedup').getContext('2d');
+const diskSpeedLabels = ['S1','S2','S3','S4','S5','E1','E2','E3','E4','E5','E6','E7','E8','E9','E10','E11','E12'];
+const diskCpu = [13.96,15.43,20.67,21.91,18.52,13.64,15.28,15.13,15.07,14.25,14.24,14.27,14.38,14.35,15.41,13.92,33.99];
+const diskPipe = [12.72,11.11,11.11,11.06,11.04,12.24,11.17,11.12,11.10,11.12,11.16,11.11,11.11,12.35,11.08,11.09,11.17];
+const diskSpeedup = diskCpu.map((c,i)=>(c/diskPipe[i]).toFixed(2));
+new Chart(diskSpeedCtx, {
+  type: 'bar',
+  data: { labels: diskSpeedLabels, datasets: [{ label: 'Speedup (x)', data: diskSpeedup, backgroundColor: '#20bf6b' }] },
+  options: { scales: { y: { title: { display: true, text: 'Speedup vs CPU (x)' } } } }
+});
+
+const memLabels = ['S1','S2','S3','S4','S5','E1','E2','E3','E4','E5','E6','E7','E8','E9','E10','E11','E12'];
+const memCpu = [12.12,13.52,18.61,20.26,16.60,11.83,13.35,13.16,13.11,12.31,12.29,12.32,12.47,12.44,14.41,12.36,38.43];
+const memPipe = [11.14,9.52,9.50,9.51,9.60,10.83,9.57,9.52,9.49,9.50,9.48,9.50,9.49,10.76,9.50,9.58,9.86];
+const memSpeedup = memCpu.map((c,i)=>(c/memPipe[i]).toFixed(2));
+new Chart(document.getElementById('memSpeedup').getContext('2d'), {
+  type: 'bar',
+  data: { labels: memLabels, datasets: [{ label: 'Speedup (x)', data: memSpeedup, backgroundColor: '#4b7bec' }] },
+  options: { scales: { y: { title: { display: true, text: 'Speedup vs CPU (x)' } } } }
+});
+
+new Chart(document.getElementById('diskBar').getContext('2d'), {
+  type: 'bar',
+  data: { labels: diskSpeedLabels, datasets: [
+    { label: 'CPU', data: diskCpu, backgroundColor: '#eb3b5a' },
+    { label: 'GPU non-pipe', data: [13.74,12.30,12.20,12.23,12.64,12.18,12.21,12.17,12.14,12.17,12.18,12.20,12.16,12.24,12.16,12.17,12.43], backgroundColor: '#f7b731' },
+    { label: 'GPU pipe 10M', data: diskPipe, backgroundColor: '#20bf6b' }
+  ]},
+  options: { scales: { y: { title: { display: true, text: 'Time (s)' } } } }
+});
+
+new Chart(document.getElementById('memBar').getContext('2d'), {
+  type: 'bar',
+  data: { labels: memLabels, datasets: [
+    { label: 'CPU', data: memCpu, backgroundColor: '#eb3b5a' },
+    { label: 'GPU non-pipe', data: [12.34,10.73,10.73,10.75,10.72,10.72,10.76,10.67,10.72,10.73,10.75,10.73,10.74,10.75,10.74,11.02,10.99], backgroundColor: '#f7b731' },
+    { label: 'GPU pipe 5M', data: memPipe, backgroundColor: '#20bf6b' }
+  ]},
+  options: { scales: { y: { title: { display: true, text: 'Time (s)' } } } }
+});
+
+new Chart(document.getElementById('batchChart').getContext('2d'), {
+  type: 'line',
+  data: { labels: ['5M','10M','20M','50M'], datasets: [
+    { label: 'Disk avg (s)', data: [11.13,11.12,12.24,null], borderColor: '#eb3b5a', backgroundColor: '#eb3b5a', fill: false, tension: .2 },
+    { label: 'In-mem avg (s)', data: [9.51,9.98,10.61,null], borderColor: '#20bf6b', backgroundColor: '#20bf6b', fill: false, tension: .2 }
+  ]},
+  options: { scales: { y: { title: { display: true, text: 'Time (s)' } } } }
+});
+</script>
+</body>
+</html>

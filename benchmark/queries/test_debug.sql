@@ -1,0 +1,12 @@
+.print === GPU DEBUG TEST ===
+DROP TABLE IF EXISTS t_pk;
+CREATE TABLE t_pk(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+INSERT INTO t_pk VALUES(1, 5, 200);
+INSERT INTO t_pk VALUES(2, 50, 10);
+INSERT INTO t_pk VALUES(3, 3, 500);
+SELECT * FROM t_pk;
+.print ---
+SELECT * FROM t_pk WHERE a > 10;
+.print ---
+SELECT * FROM t_pk WHERE b > 100;
+.print ---

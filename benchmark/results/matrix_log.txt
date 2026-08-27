@@ -1,0 +1,24 @@
+Traceback (most recent call last):
+  File "/root/sqlite/run_matrix.py", line 35, in <module>
+    times, rc, out = run_one(binpath, script)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/sqlite/run_matrix.py", line 19, in run_one
+    p = subprocess.run([binpath], stdin=open(script), capture_output=True, text=True)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: 'sqlite3_cpu'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/root/sqlite/run_matrix.py", line 38, in <module>
+    print(f'[{elapsed(start)}] {key} ERROR {e}', flush=True)
+              ^^^^^^^
+NameError: name 'elapsed' is not defined
+EXIT True

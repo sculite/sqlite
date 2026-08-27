@@ -1,0 +1,40 @@
+500000000
+============ IN-MEMORY 500M TESTS ============
+
+S1: age = 30
+8333334
+Run Time: real 12.146910 user 12.146639 sys 0.000000
+
+S2: score > 50
+245000000
+Run Time: real 13.489274 user 13.488846 sys 0.000000
+
+S3: age >= 25 AND score <= 75
+348333331
+Run Time: real 18.584666 user 18.584416 sys 0.000000
+
+S4: age > 30 AND score < 80 AND category = 5
+33333333
+Run Time: real 20.057576 user 20.057366 sys 0.000000
+
+S5: value >= 1000 AND value < 5000
+200000000
+Run Time: real 16.577124 user 16.576965 sys 0.000000
+
+E1: age > 999 (0 match)
+0
+Run Time: real 11.803240 user 11.803112 sys 0.000000
+
+E2: age >= 0 (all)
+500000000
+Run Time: real 13.300558 user 13.300332 sys 0.000000
+
+E10: category = 7
+50000000
+Run Time: real 14.132893 user 14.132744 sys 0.000000
+
+E12: 6 conditions
+500000000
+Run Time: real 37.185838 user 37.185377 sys 0.000000
+
+Done!

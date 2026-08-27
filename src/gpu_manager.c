@@ -34,6 +34,15 @@ extern int gpuWhereClauseRowids(
     int numConditions,
     int rootConditionIndex
 );
+extern int gpuWhereClauseCountSubmit(
+    const long long* h_data,
+    const GpuCondition* h_conditions,
+    int numRows,
+    int numColumns,
+    int numConditions,
+    int rootConditionIndex
+);
+extern int gpuWhereClauseCountCollect(int* h_outputCount);
 
 static int g_gpuInitialized = 0;
 static int g_gpuAvailable = 0;
@@ -219,5 +228,22 @@ int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* o
     *outputRowids = ctx->outputBuffer;
     *outputRows = resultCount;
     return 0;
+}
+
+int gpuWhereContextSubmitCount(GpuWhereContext* ctx, const long long* data, int numRows) {
+    if(!ctx || !data || numRows <= 0) return -1;
+
+    return gpuWhereClauseCountSubmit(
+        data,
+        ctx->conditions,
+        numRows,
+        ctx->numColumns,
+        ctx->numConditions,
+        ctx->rootConditionIndex
+    );
+}
+
+int gpuWhereContextCollectCount(int* outputRows) {
+    return gpuWhereClauseCountCollect(outputRows);
 }
 //Yes no comments, I cant
