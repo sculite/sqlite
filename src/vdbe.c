@@ -9285,19 +9285,21 @@ case OP_GpuScan: {
               if( setDataRc == 0 ){
                 getRowidsRc = gpuWhereContextRowids(gpuCtx, &batchRowids, &batchCount);
                 if( getRowidsRc == 0 && batchCount > 0 ){
-                  int newCap = rowidsCapacity ? rowidsCapacity * 2 : 1024*1024;
-                  long long *tmp;
-                  while( newCap < totalRowids + batchCount ) newCap *= 2;
-                  tmp = (long long*)sqlite3DbMallocRaw(db, (u64)newCap * sizeof(long long));
-                  if( tmp ){
-                    if( allRowids ){
-                      memcpy(tmp, allRowids, (u64)totalRowids * sizeof(long long));
-                      sqlite3DbFree(db, allRowids);
+                  if( totalRowids + batchCount > rowidsCapacity ){
+                    int newCap = rowidsCapacity ? rowidsCapacity * 2 : 1024*1024;
+                    long long *tmp;
+                    while( newCap < totalRowids + batchCount ) newCap *= 2;
+                    tmp = (long long*)sqlite3DbMallocRaw(db, (u64)newCap * sizeof(long long));
+                    if( tmp ){
+                      if( allRowids ){
+                        memcpy(tmp, allRowids, (u64)totalRowids * sizeof(long long));
+                        sqlite3DbFree(db, allRowids);
+                      }
+                      allRowids = tmp;
+                      rowidsCapacity = newCap;
+                    }else{
+                      break;
                     }
-                    allRowids = tmp;
-                    rowidsCapacity = newCap;
-                  }else{
-                    break;
                   }
                   memcpy(allRowids + totalRowids, batchRowids,
                          (u64)batchCount * sizeof(long long));
