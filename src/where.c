@@ -7588,8 +7588,23 @@ void sqlite3WhereEnd(WhereInfo *pWInfo){
               }
             }
             pWInfo->pGpuCtx = NULL;  
-            addrGpuScan = sqlite3VdbeAddOp3(v, OP_GpuScan,
-                pLevel->p1, pLevel->p2, 0);
+
+            {
+              int iLimitReg = -1;
+              if( !pIter->isAggregateOnly
+               && pWInfo->pSelect
+               && pWInfo->pSelect->iLimit>0
+               && pWInfo->pSelect->iOffset==0
+               && pWInfo->pSelect->pWin==0
+               && pWInfo->pOrderBy==0
+               && (pWInfo->pSelect->selFlags
+                   & (SF_Aggregate|SF_Distinct|SF_Compound|SF_Recursive))==0
+              ){
+                iLimitReg = pWInfo->pSelect->iLimit;
+              }
+              addrGpuScan = sqlite3VdbeAddOp3(v, OP_GpuScan,
+                  pLevel->p1, pLevel->p2, iLimitReg);
+            }
             sqlite3VdbeChangeP4(v, addrGpuScan, (const char*)pIter, P4_DYNAMIC);
             sqlite3VdbeChangeP5(v, pLevel->p5);
             VdbeComment((v, "GPU: deferred Btree scan"));

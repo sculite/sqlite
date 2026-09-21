@@ -9108,7 +9108,7 @@ case OP_Abortable: {
 
 #ifdef SQLITE_ENABLE_GPU_SCAN
 #include "gpu_config.h"
-/* Opcode: GpuScan P1 P2 * P4 *
+/* Opcode: GpuScan P1 P2 P3 * P5
 ** Synopsis: seek to next GPU-matching rowid
 **
 ** P1 is a cursor number for a rowid table. P2 is a jump destination.
@@ -9146,6 +9146,7 @@ case OP_GpuScan: {
     int segFill = 0;
     int rc2;
     long long aggFirstRowid = -1;  
+    sqlite3_int64 iLimitShort = -1; 
 
     db = p->db;
     nColumns = pIter->nColumns;
@@ -9163,6 +9164,13 @@ case OP_GpuScan: {
         segRows = GPU_BATCH_SIZE;
       }
       if( segRows < 1 ) segRows = 1;
+    }
+
+    if( pOp->p3>=1 ){
+      Mem *pM = &aMem[pOp->p3];
+      if( (pM->flags & (MEM_Int|MEM_Real))!=0 ){
+        iLimitShort = sqlite3VdbeIntValue(pM);
+      }
     }
     pBt = db->aDb[pIter->iDb].pBt;
     if( !pBt || pIter->iRootPage <= 0 ) goto gpuScanDeferredDone;
@@ -9192,7 +9200,8 @@ case OP_GpuScan: {
         long long *nxtBuf = pIter->isAggregateOnly ? tableDataB : NULL;
         int hasPending = 0;     
         
-        while( rc2 == SQLITE_OK && scanRes == 0 ){
+        while( rc2 == SQLITE_OK && scanRes == 0
+               && (iLimitShort<0 || totalRows < iLimitShort) ){
           actualRows = 0;
           while( rc2 == SQLITE_OK && scanRes == 0
                  && actualRows < GPU_BATCH_SIZE ){
@@ -9432,6 +9441,9 @@ case OP_GpuScan: {
         pNewIter->nSegs = (u32)segCount;
         pNewIter->segCap = (u32)segRows;
         pNewIter->count = totalRows;
+        if( iLimitShort>=0 && (sqlite3_int64)pNewIter->count > iLimitShort ){
+          pNewIter->count = (u32)iLimitShort;
+        }
         pNewIter->idx = 0;
         if( !pC->nullRow && pC->uc.pCursor
          && pNewIter->rowsSeg[0] != 0
