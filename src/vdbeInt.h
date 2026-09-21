@@ -97,6 +97,10 @@ struct VdbeCursor {
     u32 *aAltMap;           /* Mapping from table to index column numbers */
   } ub;
   i64 seqCount;           /* Sequence counter */
+#ifdef SQLITE_ENABLE_GPU_SCAN
+  const long long *gpuRow; /* Base of current row served from GPU buffer */
+  u32 gpuRowWidth;         /* Number of long longs in a gpuRow buffer row */
+#endif
 
   /* Cached OP_Column parse information is only valid if cacheStatus matches
   ** Vdbe.cacheCtr.  Vdbe.cacheCtr will never take on the value of
@@ -751,6 +755,7 @@ int sqlite3VdbeCheckFkDeferred(Vdbe*);
 
 typedef struct GpuRowidIter {
   i64 *rowids;      
+  i64 *rows;        
   int count;      
   int idx;          
   void *pGpuCtx;     
@@ -768,6 +773,7 @@ extern void gpuWhereContextDestroy(GpuWhereContext* ctx);
 extern int gpuWhereContextAddCondition(GpuWhereContext* ctx, const GpuCondition* cond);
 extern int gpuWhereContextSetRootCondition(GpuWhereContext* ctx, int rootIndex);
 extern int gpuWhereContextSetData(GpuWhereContext* ctx, const long long* data, int numRows);
+extern int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* outputRows);
 extern int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* outputRows);
 extern int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows);
 #endif
