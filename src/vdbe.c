@@ -9138,9 +9138,12 @@ case OP_GpuScan: {
     Btree *pBt;
     int actualRows;
     long long *tableData;
-    long long *allRows = NULL;
+    long long **allSegs = NULL;
     int totalRows = 0;
-    int rowsCapacity = 0;
+    int segCapacity = 0;
+    int segCount = 0;
+    int segRows = 0;
+    int segFill = 0;
     int rc2;
     long long aggFirstRowid = -1;  
 
@@ -9148,6 +9151,19 @@ case OP_GpuScan: {
     nColumns = pIter->nColumns;
     
     if( !db || nColumns <= 0 ) goto gpuScanDeferredDone;
+
+    {
+      sqlite3_int64 segBytes =
+          (sqlite3_int64)GPU_BATCH_SIZE * (sqlite3_int64)nColumns
+          * (sqlite3_int64)sizeof(i64);
+      if( segBytes > 1024LL*1024*1024 ){
+        segRows = (int)((1024LL*1024*1024)
+                        / ((sqlite3_int64)nColumns*(sqlite3_int64)sizeof(i64)));
+      }else{
+        segRows = GPU_BATCH_SIZE;
+      }
+      if( segRows < 1 ) segRows = 1;
+    }
     pBt = db->aDb[pIter->iDb].pBt;
     if( !pBt || pIter->iRootPage <= 0 ) goto gpuScanDeferredDone;
 
@@ -9297,30 +9313,50 @@ case OP_GpuScan: {
               if( setDataRc == 0
                && gpuWhereContextExecute(gpuCtx, &batchRows, &batchCount)==0
                && batchCount > 0 ){
-                if( totalRows + batchCount > rowsCapacity ){
-                  int newCap = rowsCapacity ? rowsCapacity * 2 : 1024*1024;
-                  long long *tmp;
-                  while( newCap < totalRows + batchCount ) newCap *= 2;
-                  tmp = (long long*)sqlite3DbMallocRaw(db,
-                      (u64)newCap * (u64)nColumns * sizeof(long long));
-                  if( tmp ){
-                    if( allRows ){
-                      memcpy(tmp, allRows,
-                             (u64)totalRows * (u64)nColumns * sizeof(long long));
-                      sqlite3DbFree(db, allRows);
+                {
+                  int nRemain = batchCount;
+                  long long *src = batchRows;
+                  while( nRemain > 0 ){
+                    int room = segRows - segFill;
+                    int nTake = nRemain < room ? nRemain : room;
+                    long long *seg;
+                    if( segCount == segCapacity ){
+                      int newCap = segCapacity ? segCapacity * 2 : 16;
+                      long long **tmp;
+                      tmp = (long long**)sqlite3DbMallocRaw(db,
+                          (u64)newCap * sizeof(long long*));
+                      if( !tmp ) goto gpuScanCollectOom;
+                      if( allSegs ){
+                        memcpy(tmp, allSegs,
+                               (u64)segCount * sizeof(long long*));
+                        sqlite3DbFree(db, allSegs);
+                      }
+                      allSegs = tmp;
+                      segCapacity = newCap;
                     }
-                    allRows = tmp;
-                    rowsCapacity = newCap;
-                  }else{
-                    break;
+                    if( segFill == 0 ){
+                      seg = (long long*)sqlite3DbMallocRaw(db,
+                          (u64)segRows * (u64)nColumns * sizeof(long long));
+                      if( !seg ) goto gpuScanCollectOom;
+                      allSegs[segCount++] = seg;
+                    }
+                    seg = allSegs[segCount-1];
+                    memcpy(seg + (sqlite3_int64)segFill * nColumns, src,
+                           (u64)nTake * (u64)nColumns * sizeof(long long));
+                    segFill += nTake;
+                    src += (sqlite3_int64)nTake * nColumns;
+                    nRemain -= nTake;
+                    if( segFill >= segRows ) segFill = 0;
                   }
+                  totalRows += batchCount;
                 }
-                memcpy(allRows + (i64)totalRows * nColumns, batchRows,
-                       (u64)batchCount * (u64)nColumns * sizeof(long long));
-                totalRows += batchCount;
               }
             }
           }
+          
+        gpuScanCollectOom:
+          (void)0;
+        }
           
 
           if( pIter->isAggregateOnly && nxtBuf ){
@@ -9328,7 +9364,6 @@ case OP_GpuScan: {
             curBuf = nxtBuf;
             nxtBuf = tmp;
           }
-        }
         
         if( hasPending ){
           int c = 0;
@@ -9385,31 +9420,46 @@ case OP_GpuScan: {
       goto gpuScanNext;
     }
 
-    if( allRows && totalRows > 0 ){
+    if( allSegs && segCount > 0 && totalRows > 0 ){
       GpuRowidIter *pNewIter = (GpuRowidIter*)sqlite3DbMallocRawNN(db,
-          (u64)sizeof(GpuRowidIter) + (u64)totalRows * (u64)nColumns * sizeof(i64));
+          (u64)sizeof(GpuRowidIter) + (u64)segCount * sizeof(i64*));
       if( pNewIter ){
         memcpy(pNewIter, pIter, sizeof(GpuRowidIter));
         pNewIter->rowids = NULL;
-        pNewIter->rows = (i64*)(pNewIter + 1);
-        memcpy(pNewIter->rows, allRows,
-               (u64)totalRows * (u64)nColumns * sizeof(i64));
+        pNewIter->rowsSeg = (i64**)(pNewIter + 1);
+        memcpy(pNewIter->rowsSeg, allSegs,
+               (u64)segCount * sizeof(i64*));
+        pNewIter->nSegs = (u32)segCount;
+        pNewIter->segCap = (u32)segRows;
         pNewIter->count = totalRows;
         pNewIter->idx = 0;
         if( !pC->nullRow && pC->uc.pCursor
-         && pNewIter->rows[0] == sqlite3BtreeIntegerKey(pC->uc.pCursor) ){
+         && pNewIter->rowsSeg[0] != 0
+         && pNewIter->rowsSeg[0][0] == sqlite3BtreeIntegerKey(pC->uc.pCursor) ){
           pNewIter->idx = 1;
         }
-        sqlite3DbFree(db, allRows);
+        sqlite3DbFree(db, allSegs);
         sqlite3DbFreeNN(db, pIter);
         pIter = pNewIter;
         pOp->p4.p = pNewIter;
       }else{
-        sqlite3DbFree(db, allRows);
+        {
+          int k;
+          for( k=0; k<segCount; k++ ){
+            sqlite3DbFree(db, allSegs[k]);
+          }
+        }
+        sqlite3DbFree(db, allSegs);
         goto gpuScanDeferredDone;
       }
     }else{
-      sqlite3DbFree(db, allRows);
+      if( allSegs ){
+        int k;
+        for( k=0; k<segCount; k++ ){
+          sqlite3DbFree(db, allSegs[k]);
+        }
+        sqlite3DbFree(db, allSegs);
+      }
       goto gpuScanDeferredDone;
     }
     goto gpuScanNext;
@@ -9417,7 +9467,15 @@ case OP_GpuScan: {
 gpuScanDeferredDone:
     gpuWhereContextDestroy((GpuWhereContext*)pIter->pGpuCtx);
     pIter->pGpuCtx = NULL;
-    pIter->rows = NULL;
+    if( pIter->rowsSeg ){
+      u32 k;
+      for( k=0; k<pIter->nSegs; k++ ){
+        sqlite3DbFree(db, pIter->rowsSeg[k]);
+      }
+      pIter->rowsSeg = NULL;
+      pIter->nSegs = 0;
+      pIter->segCap = 0;
+    }
     pIter->rowids = NULL;
     pIter->count = 0;
     pIter->idx = 0;
@@ -9425,6 +9483,15 @@ gpuScanDeferredDone:
 
 gpuScanNext:
   if( pIter->idx >= pIter->count ){
+    if( pIter->rowsSeg ){
+      u32 k;
+      for( k=0; k<pIter->nSegs; k++ ){
+        sqlite3DbFree(p->db, pIter->rowsSeg[k]);
+      }
+      pIter->rowsSeg = 0;
+      pIter->nSegs = 0;
+      pIter->segCap = 0;
+    }
     rc = SQLITE_OK;
     pC->nullRow = 1;
 #ifdef SQLITE_ENABLE_GPU_SCAN
@@ -9440,8 +9507,11 @@ gpuScanNext:
     goto jump_to_p2_and_check_for_interrupt;
   }
 #ifdef SQLITE_ENABLE_GPU_SCAN
-  if( pIter->rows ){
-    pC->gpuRow = &pIter->rows[(i64)pIter->idx * pIter->nColumns];
+  if( pIter->rowsSeg ){
+    sqlite3_int64 rowIndex = pIter->idx;
+    sqlite3_int64 segIdx = rowIndex / (sqlite3_int64)pIter->segCap;
+    sqlite3_int64 segOff = rowIndex % (sqlite3_int64)pIter->segCap;
+    pC->gpuRow = &pIter->rowsSeg[segIdx][segOff * pIter->nColumns];
     pC->gpuRowWidth = (u32)pIter->nColumns;
     pIter->idx++;
     pC->nullRow = 0;

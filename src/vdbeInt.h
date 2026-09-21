@@ -755,7 +755,9 @@ int sqlite3VdbeCheckFkDeferred(Vdbe*);
 
 typedef struct GpuRowidIter {
   i64 *rowids;      
-  i64 *rows;        
+  i64 **rowsSeg;    
+  u32 nSegs;        
+  u32 segCap;       
   int count;      
   int idx;          
   void *pGpuCtx;     
