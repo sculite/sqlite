@@ -3587,6 +3587,20 @@ int sqlite3VdbeReset(Vdbe *p){
   sqlite3 *db;
   db = p->db;
 
+#ifdef SQLITE_ENABLE_GPU_SCAN
+
+  db->gpuAggActive = 0;
+  if( db->gpuAggInject ){
+    GpuAggInject *pFree = db->gpuAggInject;
+    while( pFree ){
+      GpuAggInject *pN = pFree->next;
+      sqlite3DbFree(db, pFree);
+      pFree = pN;
+    }
+    db->gpuAggInject = 0;
+  }
+#endif
+
   /* If the VM did not run to completion or if it encountered an
   ** error, then it might not have been halted properly.  So halt
   ** it now.

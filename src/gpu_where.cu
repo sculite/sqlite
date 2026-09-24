@@ -1,9 +1,11 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <stdio.h>
+#include "gpu_manager.h"
 
 #define BLOCK_SIZE 256
 #define MAX_CONDITIONS 32
+#define MAX_AGGREGATES GPU_MAX_AGGREGATES_PER_QUERY
 
 /* GPU operator codes */
 enum OpCode {
@@ -32,41 +34,61 @@ struct Condition {
     int rightChild;
 };
 
-// Device function to evaluate a single condition on a row 
-__device__ int evaluateCondition(const long long* row, const Condition* cond, const Condition* allConds, int numColumns) {
+__device__ int evaluateCondition(
+    const long long* row,
+    const Condition* cond,
+    const Condition* allConds,
+    int numColumns,
+    const unsigned char* nullMask,
+    int rowIndex
+) {
     long long colValue;
     int i;
+
+    #define CELL_IS_NULL(colIdx) ( \
+        nullMask != 0 && (colIdx) >= 0 \
+        && (nullMask[(((size_t)(rowIndex) * (size_t)numColumns + (size_t)(colIdx)) >> 3)] \
+            & (1 << (((rowIndex) * numColumns + (colIdx)) & 7))) \
+    )
     
     switch(cond->opCode) {
         case OP_EQ:
+            if( CELL_IS_NULL(cond->columnIndex) ) return 0;
             colValue = row[cond->columnIndex];
             return colValue == cond->value1;
             
         case OP_NE:
+            if( CELL_IS_NULL(cond->columnIndex) ) return 0;
             colValue = row[cond->columnIndex];
             return colValue != cond->value1;
             
         case OP_LT:
+            if( CELL_IS_NULL(cond->columnIndex) ) return 0;
             colValue = row[cond->columnIndex];
             return colValue < cond->value1;
             
         case OP_LE:
+            if( CELL_IS_NULL(cond->columnIndex) ) return 0;
             colValue = row[cond->columnIndex];
             return colValue <= cond->value1;
             
         case OP_GT:
+            if( CELL_IS_NULL(cond->columnIndex) ) return 0;
             colValue = row[cond->columnIndex];
             return colValue > cond->value1;
             
         case OP_GE:
+            if( CELL_IS_NULL(cond->columnIndex) ) return 0;
             colValue = row[cond->columnIndex];
             return colValue >= cond->value1;
             
         case OP_BETWEEN:
+            if( CELL_IS_NULL(cond->columnIndex) ) return 0;
             colValue = row[cond->columnIndex];
             return (colValue >= cond->value1) && (colValue <= cond->value2);
             
         case OP_IN:
+            if( CELL_IS_NULL(cond->columnIndex) ) return 0;
             colValue = row[cond->columnIndex];
             for(i = 0; i < cond->valueCount && i < 16; i++) {
                 if(colValue == cond->inValues[i]) {
@@ -77,21 +99,21 @@ __device__ int evaluateCondition(const long long* row, const Condition* cond, co
             
         case OP_AND:
             if(cond->leftChild >= 0 && cond->rightChild >= 0) {
-                return evaluateCondition(row, &allConds[cond->leftChild], allConds, numColumns) &&
-                       evaluateCondition(row, &allConds[cond->rightChild], allConds, numColumns);
+                return evaluateCondition(row, &allConds[cond->leftChild], allConds, numColumns, nullMask, rowIndex) &&
+                       evaluateCondition(row, &allConds[cond->rightChild], allConds, numColumns, nullMask, rowIndex);
             }
             return 0;
             
         case OP_OR:
             if(cond->leftChild >= 0 && cond->rightChild >= 0) {
-                return evaluateCondition(row, &allConds[cond->leftChild], allConds, numColumns) ||
-                       evaluateCondition(row, &allConds[cond->rightChild], allConds, numColumns);
+                return evaluateCondition(row, &allConds[cond->leftChild], allConds, numColumns, nullMask, rowIndex) ||
+                       evaluateCondition(row, &allConds[cond->rightChild], allConds, numColumns, nullMask, rowIndex);
             }
             return 0;
             
         case OP_NOT:
             if(cond->leftChild >= 0) {
-                return !evaluateCondition(row, &allConds[cond->leftChild], allConds, numColumns);
+                return !evaluateCondition(row, &allConds[cond->leftChild], allConds, numColumns, nullMask, rowIndex);
             }
             return 0;
             
@@ -107,7 +129,8 @@ __global__ void whereClauseKernel(
     const Condition* conditions,
     int numRows,
     int numColumns,
-    int rootConditionIndex
+    int rootConditionIndex,
+    const unsigned char* nullMask
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -115,7 +138,7 @@ __global__ void whereClauseKernel(
         const long long* row = data + (idx * numColumns);
         
         if(rootConditionIndex >= 0) {
-            resultMask[idx] = evaluateCondition(row, &conditions[rootConditionIndex], conditions, numColumns);
+            resultMask[idx] = evaluateCondition(row, &conditions[rootConditionIndex], conditions, numColumns, nullMask, idx);
         } else {
             resultMask[idx] = 1;
         }
@@ -357,6 +380,10 @@ typedef struct DeviceScratch {
     int* d_matchCount;
     int* d_blockSums;        
     int* d_blockOffsets;     
+    unsigned char* d_nullMaskV;
+    GpuAggSpec* d_aggSpecs;
+    GpuAggPartial* d_partials;
+    GpuAggPartial* d_aggOut;
     cudaStream_t transferStream;  
     cudaStream_t computeStream;  
     size_t dataCapacity;
@@ -367,6 +394,10 @@ typedef struct DeviceScratch {
     size_t matchCountCapacity;
     size_t blockSumsCapacity;
     size_t blockOffsetsCapacity;
+    size_t nullCapacity;
+    size_t specCapacity;
+    size_t partialCapacity;
+    size_t aggOutCapacity;
 } DeviceScratch;
 
 static DeviceScratch g_deviceScratch = {0};
@@ -436,6 +467,10 @@ extern "C" void gpuWhereClauseCleanup(void) {
         if(g_deviceScratch.d_matchCount) cudaFree(g_deviceScratch.d_matchCount);
         if(g_deviceScratch.d_blockSums) cudaFree(g_deviceScratch.d_blockSums);
         if(g_deviceScratch.d_blockOffsets) cudaFree(g_deviceScratch.d_blockOffsets);
+        if(g_deviceScratch.d_nullMaskV) cudaFree(g_deviceScratch.d_nullMaskV);
+        if(g_deviceScratch.d_aggSpecs) cudaFree(g_deviceScratch.d_aggSpecs);
+        if(g_deviceScratch.d_partials) cudaFree(g_deviceScratch.d_partials);
+        if(g_deviceScratch.d_aggOut) cudaFree(g_deviceScratch.d_aggOut);
         
         if(g_deviceScratch.transferStream) cudaStreamDestroy(g_deviceScratch.transferStream);
         if(g_deviceScratch.computeStream) cudaStreamDestroy(g_deviceScratch.computeStream);
@@ -456,7 +491,8 @@ extern "C" int gpuWhereClause(
     int numRows,
     int numColumns,
     int numConditions,
-    int rootConditionIndex
+    int rootConditionIndex,
+    const unsigned char* h_nullMask
 ) {
     if(!g_gpuInitialized) {
         fprintf(stderr, "GPU: Not initialized\n");
@@ -479,6 +515,7 @@ extern "C" int gpuWhereClause(
     size_t maskSize = (size_t)numRows * sizeof(int);
     size_t blockSumsSize = ((numRows + BLOCK_SIZE - 1) / BLOCK_SIZE) * sizeof(int);
     size_t condSize = (size_t)numConditions * sizeof(Condition);
+    size_t nullSize = numRows > 0 ? ((size_t)numRows * (size_t)numColumns + 7) / 8 : 0;
 
     if(ensureDeviceBuffer((void**)&g_deviceScratch.d_data, dataSize, &g_deviceScratch.dataCapacity, "device data") != 0) {
         goto cleanup;
@@ -490,6 +527,9 @@ extern "C" int gpuWhereClause(
         if(ensureDeviceBuffer((void**)&g_deviceScratch.d_conditions, condSize, &g_deviceScratch.conditionCapacity, "device conditions") != 0) {
             goto cleanup;
         }
+    }
+    if(nullSize > 0 && ensureDeviceBuffer((void**)&g_deviceScratch.d_nullMaskV, nullSize, &g_deviceScratch.nullCapacity, "device null mask") != 0) {
+        goto cleanup;
     }
     if(ensureDeviceBuffer((void**)&g_deviceScratch.d_resultMask, maskSize, &g_deviceScratch.maskCapacity, "device result mask") != 0) {
         goto cleanup;
@@ -522,6 +562,18 @@ extern "C" int gpuWhereClause(
             goto cleanup;
         }
     }
+
+    if(nullSize > 0){
+        if(h_nullMask){
+            err = cudaMemcpyAsync(g_deviceScratch.d_nullMaskV, h_nullMask, nullSize, cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
+        }else{
+            err = cudaMemsetAsync(g_deviceScratch.d_nullMaskV, 0, nullSize, g_deviceScratch.transferStream);
+        }
+        if(err != cudaSuccess) {
+            fprintf(stderr, "GPU: Failed to upload null mask: %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+    }
     
     err = cudaStreamSynchronize(g_deviceScratch.transferStream);
     if(err != cudaSuccess) {
@@ -536,7 +588,8 @@ extern "C" int gpuWhereClause(
         g_deviceScratch.d_conditions,
         numRows,
         numColumns,
-        rootConditionIndex
+        rootConditionIndex,
+        nullSize > 0 ? g_deviceScratch.d_nullMaskV : NULL
     );
 
     err = cudaGetLastError();
@@ -653,7 +706,8 @@ extern "C" int gpuWhereClauseCount(
     int numRows,
     int numColumns,
     int numConditions,
-    int rootConditionIndex
+    int rootConditionIndex,
+    const unsigned char* h_nullMask
 ) {
     return gpuWhereClause(
         h_data,
@@ -663,7 +717,8 @@ extern "C" int gpuWhereClauseCount(
         numRows,
         numColumns,
         numConditions,
-        rootConditionIndex
+        rootConditionIndex,
+        h_nullMask
     );
 }
 
@@ -678,7 +733,8 @@ extern "C" int gpuWhereClauseCountSubmit(
     int numRows,
     int numColumns,
     int numConditions,
-    int rootConditionIndex
+    int rootConditionIndex,
+    const unsigned char* h_nullMask
 ){
     if(!g_gpuInitialized) {
         fprintf(stderr, "GPU: Not initialized\n");
@@ -693,6 +749,7 @@ extern "C" int gpuWhereClauseCountSubmit(
     size_t maskSize = (size_t)numRows * sizeof(int);
     size_t condSize = (size_t)numConditions * sizeof(Condition);
     size_t blockSumsSize = ((numRows + BLOCK_SIZE - 1) / BLOCK_SIZE) * sizeof(int);
+    size_t nullSize = ((size_t)numRows * (size_t)numColumns + 7) / 8;
 
     if(ensureDeviceBuffer((void**)&g_deviceScratch.d_data, dataSize, &g_deviceScratch.dataCapacity, "device data") != 0) {
         return -1;
@@ -703,35 +760,39 @@ extern "C" int gpuWhereClauseCountSubmit(
     if(ensureDeviceBuffer((void**)&g_deviceScratch.d_matchCount, sizeof(int), &g_deviceScratch.matchCountCapacity, "device match count") != 0) {
         return -1;
     }
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_nullMaskV, nullSize, &g_deviceScratch.nullCapacity, "device null mask") != 0) {
+        return -1;
+    }
     if(numConditions > 0) {
         if(ensureDeviceBuffer((void**)&g_deviceScratch.d_conditions, condSize, &g_deviceScratch.conditionCapacity, "device conditions") != 0) {
             return -1;
         }
     }
 
-    /* Wait for previous batch's kernel to finish before overwriting the
-    ** shared device data buffer. This serializes GPU kernels across batches
-    ** while still allowing the CPU to fill the next host buffer in parallel. */
     err = cudaStreamSynchronize(g_deviceScratch.computeStream);
     if(err != cudaSuccess) return -1;
 
-    /* Async H2D transfer of row data */
     err = cudaMemcpyAsync(g_deviceScratch.d_data, h_data, dataSize,
                           cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
     if(err != cudaSuccess) return -1;
 
-    /* Async H2D transfer of conditions */
     if(numConditions > 0) {
         err = cudaMemcpyAsync(g_deviceScratch.d_conditions, h_conditions, condSize,
                               cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
         if(err != cudaSuccess) return -1;
     }
 
-    /* Wait for H2D transfers to complete before launching kernel */
+    if(h_nullMask){
+        err = cudaMemcpyAsync(g_deviceScratch.d_nullMaskV, h_nullMask, nullSize,
+                              cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
+    }else{
+        err = cudaMemsetAsync(g_deviceScratch.d_nullMaskV, 0, nullSize, g_deviceScratch.transferStream);
+    }
+    if(err != cudaSuccess) return -1;
+
     err = cudaStreamSynchronize(g_deviceScratch.transferStream);
     if(err != cudaSuccess) return -1;
 
-    /* Launch filter kernel on compute stream */
     int numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
     whereClauseKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
         g_deviceScratch.d_data,
@@ -739,15 +800,14 @@ extern "C" int gpuWhereClauseCountSubmit(
         g_deviceScratch.d_conditions,
         numRows,
         numColumns,
-        rootConditionIndex
+        rootConditionIndex,
+        g_deviceScratch.d_nullMaskV
     );
     if(cudaGetLastError() != cudaSuccess) return -1;
 
-    /* Zero match count */
     err = cudaMemsetAsync(g_deviceScratch.d_matchCount, 0, sizeof(int), g_deviceScratch.computeStream);
     if(err != cudaSuccess) return -1;
 
-    /* Launch count kernel on compute stream */
     countMatchesKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
         g_deviceScratch.d_resultMask,
         g_deviceScratch.d_matchCount,
@@ -755,20 +815,17 @@ extern "C" int gpuWhereClauseCountSubmit(
     );
     if(cudaGetLastError() != cudaSuccess) return -1;
 
-    /* Kernel launched asynchronously — return without waiting */
     return 0;
 }
 
 extern "C" int gpuWhereClauseCountCollect(int* h_outputCount) {
     if(!h_outputCount) return -1;
 
-    /* D2H transfer of count (tiny, 4 bytes) */
     cudaError_t err = cudaMemcpyAsync(h_outputCount, g_deviceScratch.d_matchCount,
                                        sizeof(int), cudaMemcpyDeviceToHost,
                                        g_deviceScratch.computeStream);
     if(err != cudaSuccess) return -1;
 
-    /* Block until count is available */
     err = cudaStreamSynchronize(g_deviceScratch.computeStream);
     if(err != cudaSuccess) return -1;
 
@@ -799,7 +856,8 @@ extern "C" int gpuWhereClauseRowids(
     int numRows,
     int numColumns,
     int numConditions,
-    int rootConditionIndex
+    int rootConditionIndex,
+    const unsigned char* h_nullMask
 ) {
     if(!g_gpuInitialized) {
         fprintf(stderr, "GPU: Not initialized\n");
@@ -816,6 +874,7 @@ extern "C" int gpuWhereClauseRowids(
     size_t maskSize = (size_t)numRows * sizeof(int);
     size_t condSize = (size_t)numConditions * sizeof(Condition);
     size_t dataSize = (size_t)numRows * (size_t)numColumns * sizeof(long long);
+    size_t nullSize = numRows > 0 ? ((size_t)numRows * (size_t)numColumns + 7) / 8 : 0;
 
     if(ensureDeviceBuffer((void**)&g_deviceScratch.d_data, dataSize, &g_deviceScratch.dataCapacity, "device data") != 0) {
         goto cleanup;
@@ -830,6 +889,9 @@ extern "C" int gpuWhereClauseRowids(
         if(ensureDeviceBuffer((void**)&g_deviceScratch.d_conditions, condSize, &g_deviceScratch.conditionCapacity, "device conditions") != 0) {
             goto cleanup;
         }
+    }
+    if(nullSize > 0 && ensureDeviceBuffer((void**)&g_deviceScratch.d_nullMaskV, nullSize, &g_deviceScratch.nullCapacity, "device null mask") != 0) {
+        goto cleanup;
     }
     if(ensureDeviceBuffer((void**)&g_deviceScratch.d_resultMask, maskSize, &g_deviceScratch.maskCapacity, "device result mask") != 0) {
         goto cleanup;
@@ -857,13 +919,22 @@ extern "C" int gpuWhereClauseRowids(
         err = cudaMemcpyAsync(g_deviceScratch.d_conditions, h_conditions, condSize, cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
         if(err != cudaSuccess) { fprintf(stderr, "GPU: H2D cond copy failed: %s\n", cudaGetErrorString(err)); goto cleanup; }
     }
+    if(nullSize > 0){
+        if(h_nullMask){
+            err = cudaMemcpyAsync(g_deviceScratch.d_nullMaskV, h_nullMask, nullSize, cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
+        }else{
+            err = cudaMemsetAsync(g_deviceScratch.d_nullMaskV, 0, nullSize, g_deviceScratch.transferStream);
+        }
+        if(err != cudaSuccess) { fprintf(stderr, "GPU: H2D null mask failed: %s\n", cudaGetErrorString(err)); goto cleanup; }
+    }
     err = cudaStreamSynchronize(g_deviceScratch.transferStream);
     if(err != cudaSuccess) { fprintf(stderr, "GPU: Transfer sync failed: %s\n", cudaGetErrorString(err)); goto cleanup; }
 
     numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
     whereClauseKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
         g_deviceScratch.d_data, g_deviceScratch.d_resultMask, g_deviceScratch.d_conditions,
-        numRows, numColumns, rootConditionIndex
+        numRows, numColumns, rootConditionIndex,
+        nullSize > 0 ? g_deviceScratch.d_nullMaskV : NULL
     );
     err = cudaGetLastError();
     if(err != cudaSuccess) { fprintf(stderr, "GPU: Kernel launch failed: %s\n", cudaGetErrorString(err)); goto cleanup; }
@@ -920,6 +991,281 @@ extern "C" int gpuWhereClauseRowids(
     err = cudaStreamSynchronize(g_deviceScratch.computeStream);
     if(err != cudaSuccess) goto cleanup;
     *h_outputCount = resultCount;
+
+cleanup:
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+
+
+__device__ inline void u128Add(unsigned long long& lo, unsigned long long& hi,
+                               unsigned long long blo, unsigned long long bhi){
+    unsigned long long oldLo = lo;
+    lo += blo;
+    hi += bhi + (lo < oldLo ? 1ULL : 0ULL);
+}
+
+__device__ inline void u128SetSigned(unsigned long long& lo, unsigned long long& hi,
+                                    long long v){
+    lo = (unsigned long long)v;
+    hi = (v < 0) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+}
+
+__global__ void aggReduceKernel(
+    const long long* data,
+    const unsigned char* nullMask,
+    const int* matchMask,
+    const GpuAggSpec* aggSpecs,
+    int numAggs,
+    GpuAggPartial* partials,
+    int numRows,
+    int numColumns
+) {
+    __shared__ unsigned long long sLo[BLOCK_SIZE];
+    __shared__ unsigned long long sHi[BLOCK_SIZE];
+    __shared__ long long sMin[BLOCK_SIZE];
+    __shared__ long long sMax[BLOCK_SIZE];
+    __shared__ long long sCnt[BLOCK_SIZE];
+    __shared__ unsigned int sHas[BLOCK_SIZE];
+
+    int t = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + t;
+    int isMatch = (idx < numRows) ? matchMask[idx] : 0;
+    const long long* row = data + ((long long)idx * numColumns);
+
+    for(int a = 0; a < numAggs; a++){
+        const GpuAggSpec sp = aggSpecs[a];
+        int use = isMatch;
+        int isNull = 0;
+        if( use && sp.columnIndex >= 0 ){
+            int bitIdx = idx * numColumns + sp.columnIndex;
+            isNull = (nullMask[bitIdx >> 3] >> (bitIdx & 7)) & 1;
+        }
+        if( sp.columnIndex >= 0 && isNull ) use = 0;
+
+        if( sp.type == GPU_AGG_COUNT_STAR || sp.type == GPU_AGG_COUNT_COL ){
+            sLo[t] = 0;
+            sHi[t] = 0;
+            sMin[t] = 0;
+            sMax[t] = 0;
+            sHas[t] = 0;
+            sCnt[t] = use ? 1 : 0;
+        }else{
+            /* sum / avg / min / max over the integer cell value */
+            if( use ){
+                u128SetSigned(sLo[t], sHi[t], row[sp.columnIndex]);
+                sMin[t] = row[sp.columnIndex];
+                sMax[t] = row[sp.columnIndex];
+                sCnt[t] = 1;
+                sHas[t] = 1;
+            }else{
+                sLo[t] = 0;
+                sHi[t] = 0;
+                sMin[t] = 0x7FFFFFFFFFFFFFFFLL;
+                sMax[t] = 0x8000000000000000LL;
+                sCnt[t] = 0;
+                sHas[t] = 0;
+            }
+        }
+        __syncthreads();
+
+        for(int offset = BLOCK_SIZE / 2; offset > 0; offset /= 2){
+            if( t < offset ){
+                u128Add(sLo[t], sHi[t], sLo[t + offset], sHi[t + offset]);
+                if( sMin[t + offset] < sMin[t] ) sMin[t] = sMin[t + offset];
+                if( sMax[t + offset] > sMax[t] ) sMax[t] = sMax[t + offset];
+                sCnt[t] += sCnt[t + offset];
+                sHas[t] |= sHas[t + offset];
+            }
+            __syncthreads();
+        }
+
+        if( t == 0 ){
+            GpuAggPartial o;
+            o.sumLo = sLo[0];
+            o.sumHi = sHi[0];
+            o.minVal = sMin[0];
+            o.maxVal = sMax[0];
+            o.cnt = sCnt[0];
+            o.hasAny = sHas[0];
+            partials[blockIdx.x * numAggs + a] = o;
+        }
+        __syncthreads();
+    }
+}
+
+
+__global__ void aggCombineKernel(
+    const GpuAggPartial* partials,
+    GpuAggPartial* out,
+    int numBlocks,
+    int numAggs
+) {
+    int a = threadIdx.x;
+    if( a >= numAggs ) return;
+
+    GpuAggPartial acc;
+    acc.sumLo = 0;
+    acc.sumHi = 0;
+    acc.minVal = 0x7FFFFFFFFFFFFFFFLL;
+    acc.maxVal = 0x8000000000000000LL;
+    acc.cnt = 0;
+    acc.hasAny = 0;
+
+    for(int b = 0; b < numBlocks; b++){
+        const GpuAggPartial p = partials[b * numAggs + a];
+        u128Add(acc.sumLo, acc.sumHi, p.sumLo, p.sumHi);
+        if( p.hasAny ){
+            if( p.minVal < acc.minVal ) acc.minVal = p.minVal;
+            if( p.maxVal > acc.maxVal ) acc.maxVal = p.maxVal;
+        }
+        acc.cnt += p.cnt;
+        acc.hasAny |= p.hasAny;
+    }
+    out[a] = acc;
+}
+
+extern "C" int gpuWhereClauseAgg(
+    const long long* h_data,
+    const unsigned char* h_nullMask,
+    long long* h_output,
+    int* h_outputCount,
+    const Condition* h_conditions,
+    GpuAggPartial* h_aggOut,
+    const GpuAggSpec* h_aggSpecs,
+    int numAggs,
+    int numRows,
+    int numColumns,
+    int numConditions,
+    int rootConditionIndex,
+    int wantRows
+) {
+    if(!g_gpuInitialized) {
+        fprintf(stderr, "GPU: Not initialized\n");
+        return -1;
+    }
+    if(!h_data || numAggs<=0 || numAggs>MAX_AGGREGATES) {
+        fprintf(stderr, "GPU: Invalid agg parameters\n");
+        return -1;
+    }
+
+    cudaError_t err = cudaSuccess;
+    int numBlocks = (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    size_t dataSize = (size_t)numRows * (size_t)numColumns * sizeof(long long);
+    size_t maskSize = (size_t)numRows * sizeof(int);
+    size_t condSize = (size_t)numConditions * sizeof(Condition);
+    size_t nullSize = ((size_t)numRows * (size_t)numColumns + 7) / 8;
+    size_t specSize = (size_t)numAggs * sizeof(GpuAggSpec);
+    size_t partialSize = (size_t)numBlocks * (size_t)numAggs * sizeof(GpuAggPartial);
+    size_t aggOutSize = (size_t)numAggs * sizeof(GpuAggPartial);
+    size_t blockSumsSize = (size_t)numBlocks * sizeof(int);
+    int resultCount = 0;
+
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_data, dataSize, &g_deviceScratch.dataCapacity, "device data") != 0) return -1;
+    if(numConditions > 0){
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_conditions, condSize, &g_deviceScratch.conditionCapacity, "device conditions") != 0) return -1;
+    }
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_nullMaskV, nullSize, &g_deviceScratch.nullCapacity, "device null mask") != 0) return -1;
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_aggSpecs, specSize, &g_deviceScratch.specCapacity, "device agg specs") != 0) return -1;
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_partials, partialSize, &g_deviceScratch.partialCapacity, "device agg partials") != 0) return -1;
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_aggOut, aggOutSize, &g_deviceScratch.aggOutCapacity, "device agg out") != 0) return -1;
+    if(ensureDeviceBuffer((void**)&g_deviceScratch.d_resultMask, maskSize, &g_deviceScratch.maskCapacity, "device result mask") != 0) return -1;
+
+    err = cudaMemcpyAsync(g_deviceScratch.d_data, h_data, dataSize, cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
+    if(err != cudaSuccess) goto cleanup;
+    if(numConditions > 0){
+        err = cudaMemcpyAsync(g_deviceScratch.d_conditions, h_conditions, condSize, cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
+        if(err != cudaSuccess) goto cleanup;
+    }
+    if(h_nullMask && nullSize > 0){
+        err = cudaMemcpyAsync(g_deviceScratch.d_nullMaskV, h_nullMask, nullSize, cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
+        if(err != cudaSuccess) goto cleanup;
+    }else if( nullSize > 0 ){
+        err = cudaMemsetAsync(g_deviceScratch.d_nullMaskV, 0, nullSize, g_deviceScratch.transferStream);
+        if(err != cudaSuccess) goto cleanup;
+    }
+    err = cudaMemcpyAsync(g_deviceScratch.d_aggSpecs, h_aggSpecs, specSize, cudaMemcpyHostToDevice, g_deviceScratch.transferStream);
+    if(err != cudaSuccess) goto cleanup;
+    err = cudaStreamSynchronize(g_deviceScratch.transferStream);
+    if(err != cudaSuccess) goto cleanup;
+
+    whereClauseKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
+        g_deviceScratch.d_data, g_deviceScratch.d_resultMask, g_deviceScratch.d_conditions,
+        numRows, numColumns, rootConditionIndex, g_deviceScratch.d_nullMaskV
+    );
+    err = cudaGetLastError();
+    if(err != cudaSuccess){ fprintf(stderr, "GPU: Agg where kernel failed: %s\n", cudaGetErrorString(err)); goto cleanup; }
+
+    aggReduceKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
+        g_deviceScratch.d_data,
+        g_deviceScratch.d_nullMaskV,
+        g_deviceScratch.d_resultMask,
+        g_deviceScratch.d_aggSpecs,
+        numAggs,
+        g_deviceScratch.d_partials,
+        numRows,
+        numColumns
+    );
+    err = cudaGetLastError();
+    if(err != cudaSuccess){ fprintf(stderr, "GPU: Agg reduce kernel failed: %s\n", cudaGetErrorString(err)); goto cleanup; }
+
+    aggCombineKernel<<<1, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
+        g_deviceScratch.d_partials, g_deviceScratch.d_aggOut, numBlocks, numAggs
+    );
+    err = cudaGetLastError();
+    if(err != cudaSuccess){ fprintf(stderr, "GPU: Agg combine kernel failed: %s\n", cudaGetErrorString(err)); goto cleanup; }
+
+    err = cudaMemcpyAsync(h_aggOut, g_deviceScratch.d_aggOut, aggOutSize, cudaMemcpyDeviceToHost, g_deviceScratch.computeStream);
+    if(err != cudaSuccess) goto cleanup;
+
+    if( wantRows && h_output && h_outputCount ){
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_output, dataSize, &g_deviceScratch.outputCapacity, "device output") != 0) return -1;
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_scanIndices, maskSize, &g_deviceScratch.scanCapacity, "device scan indices") != 0) return -1;
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_blockSums, blockSumsSize, &g_deviceScratch.blockSumsCapacity, "device block sums") != 0) return -1;
+        if(ensureDeviceBuffer((void**)&g_deviceScratch.d_blockOffsets, blockSumsSize, &g_deviceScratch.blockOffsetsCapacity, "device block offsets") != 0) return -1;
+
+        err = cudaStreamSynchronize(g_deviceScratch.computeStream);
+        if(err != cudaSuccess) goto cleanup;
+
+        if(gpuPrefixSum(g_deviceScratch.d_resultMask, g_deviceScratch.d_scanIndices,
+                       g_deviceScratch.d_blockSums, g_deviceScratch.d_blockOffsets,
+                       numRows, g_deviceScratch.computeStream) != 0) goto cleanup;
+
+        {
+            int lastScanIndex = 0, lastMask = 0;
+            err = cudaMemcpyAsync(&lastScanIndex, g_deviceScratch.d_scanIndices + numRows - 1, sizeof(int), cudaMemcpyDeviceToHost, g_deviceScratch.computeStream);
+            if(err != cudaSuccess) goto cleanup;
+            err = cudaMemcpyAsync(&lastMask, g_deviceScratch.d_resultMask + numRows - 1, sizeof(int), cudaMemcpyDeviceToHost, g_deviceScratch.computeStream);
+            if(err != cudaSuccess) goto cleanup;
+            err = cudaStreamSynchronize(g_deviceScratch.computeStream);
+            if(err != cudaSuccess) goto cleanup;
+            resultCount = lastScanIndex + lastMask;
+        }
+
+        if(resultCount > 0){
+            compactResultsKernel<<<numBlocks, BLOCK_SIZE, 0, g_deviceScratch.computeStream>>>(
+                g_deviceScratch.d_data, g_deviceScratch.d_output,
+                g_deviceScratch.d_resultMask, g_deviceScratch.d_scanIndices,
+                numRows, numColumns
+            );
+            err = cudaGetLastError();
+            if(err != cudaSuccess) goto cleanup;
+            {
+                size_t outputSize = (size_t)resultCount * (size_t)numColumns * sizeof(long long);
+                err = cudaMemcpyAsync(h_output, g_deviceScratch.d_output, outputSize, cudaMemcpyDeviceToHost, g_deviceScratch.computeStream);
+                if(err != cudaSuccess) goto cleanup;
+            }
+        }
+        err = cudaStreamSynchronize(g_deviceScratch.computeStream);
+        if(err != cudaSuccess) goto cleanup;
+        *h_outputCount = resultCount;
+    }else{
+        err = cudaStreamSynchronize(g_deviceScratch.computeStream);
+        if(err != cudaSuccess) goto cleanup;
+        if( h_outputCount ) *h_outputCount = 0;
+    }
+
+    err = cudaSuccess;
 
 cleanup:
     return (err == cudaSuccess) ? 0 : -1;

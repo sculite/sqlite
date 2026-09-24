@@ -6659,6 +6659,146 @@ static int sqlite3IsGPUEligible(WhereInfo *pWInfo){
   // printf("GPU Scan eligible\n"); 
   return 1;
 }
+
+#define GPU_AGG_SPEC_MAX 8   
+
+
+typedef struct GpuAggWalk {
+  const Table *pTab;    
+  int iCursor;          
+  GpuAggSpec *pSpec;    
+  int n;                
+  int nMax;             
+  int bFail;            
+} GpuAggWalk;
+
+
+static void gpuAggEvaluateFunc(GpuAggWalk *pW, Expr *pF){
+  const char *zName;
+  Expr *pArg;
+  int nArg;
+  int iCol;
+  int type = -1;
+  int iColGpu;
+  int k;
+  if( pW->bFail ) return;
+  if( pW->n>=pW->nMax ){ pW->bFail = 1; return; }
+  if( ExprHasProperty(pF, EP_WinFunc|EP_Distinct) ){ pW->bFail = 1; return; }
+  if( pF->pLeft ){ pW->bFail = 1; return; }   
+  assert( ExprUseXList(pF) && ExprUseUToken(pF) );
+  zName = pF->u.zToken;
+  nArg = pF->x.pList ? pF->x.pList->nExpr : 0;
+  if( nArg==0 ){
+    if( sqlite3StrICmp(zName,"count")!=0 ){ pW->bFail = 1; return; }
+    type = GPU_AGG_COUNT_STAR;
+    iColGpu = -1;
+  }else{
+    if( nArg!=1 ){ pW->bFail = 1; return; }
+    pArg = sqlite3ExprSkipCollateAndLikely(pF->x.pList->a[0].pExpr);
+    if( (pArg->op!=TK_COLUMN && pArg->op!=TK_AGG_COLUMN) ){ pW->bFail = 1; return; }
+    if( pArg->iTable!=pW->iCursor ){ pW->bFail = 1; return; }
+    iCol = pArg->iColumn;
+    if( iCol==XN_ROWID ){
+      iColGpu = 0;      
+    }else{
+      char aff;
+      if( iCol<0 || iCol>=pW->pTab->nCol ){ pW->bFail = 1; return; }
+      aff = pW->pTab->aCol[iCol].affinity;
+      if( pW->pTab->aCol[iCol].colFlags & (COLFLAG_VIRTUAL|COLFLAG_STORED) ){
+        pW->bFail = 1; return;
+      }
+      if( aff!=SQLITE_AFF_INTEGER ){ pW->bFail = 1; return; }
+      iColGpu = iCol+1;
+    }
+    if( sqlite3StrICmp(zName,"count")==0 ){
+      type = GPU_AGG_COUNT_COL;
+    }else if( sqlite3StrICmp(zName,"sum")==0 ){
+      type = GPU_AGG_SUM;
+    }else if( sqlite3StrICmp(zName,"avg")==0 ){
+      type = GPU_AGG_AVG;
+    }else if( sqlite3StrICmp(zName,"min")==0 ){
+      type = GPU_AGG_MIN;
+    }else if( sqlite3StrICmp(zName,"max")==0 ){
+      type = GPU_AGG_MAX;
+    }else{
+      pW->bFail = 1; return;
+    }
+  }
+
+  for(k=0; k<pW->n; k++){
+    if( pW->pSpec[k].type==type && pW->pSpec[k].columnIndex==iColGpu ) return;
+  }
+  if( pW->n<pW->nMax ){
+    pW->pSpec[pW->n].type = type;
+    pW->pSpec[pW->n].columnIndex = iColGpu;
+    pW->n++;
+  }else{
+    pW->bFail = 1;
+  }
+}
+
+static void gpuAggWalkExpr(GpuAggWalk *pW, Expr *pExpr){
+  int i;
+  if( pExpr==0 || pW->bFail ) return;
+  if( pExpr->op==TK_AGG_FUNCTION ){
+    gpuAggEvaluateFunc(pW, pExpr);
+    if( pW->bFail ) return;
+  }
+  if( ExprHasProperty(pExpr, EP_TokenOnly|EP_Leaf) ) return;
+  if( pExpr->op==TK_SELECT || pExpr->op==TK_EXISTS || pExpr->op==TK_IN ){
+    return;   
+  }
+  if( ExprUseXSelect(pExpr) ){
+    pW->bFail = 1;   
+    return;
+  }
+  if( pExpr->pLeft ){
+    Expr *pL = pExpr->pLeft;
+    gpuAggWalkExpr(pW, pL);
+    if( pW->bFail ) return;
+  }
+  if( pExpr->pRight ){
+    gpuAggWalkExpr(pW, pExpr->pRight);
+  }else if( ExprUseXList(pExpr) && pExpr->x.pList ){
+    for(i=0; i<pExpr->x.pList->nExpr && !pW->bFail; i++){
+      gpuAggWalkExpr(pW, pExpr->x.pList->a[i].pExpr);
+    }
+  }
+}
+
+
+static int sqlite3IsGpuAggEligible(WhereInfo *pWInfo, GpuAggSpec *pSpec, int nMax){
+  const Select *pSel;
+  const Table *pTab;
+  GpuAggWalk w;
+  int i;
+  if( pWInfo==0 || pWInfo->pSelect==0 ) return 0;
+  pSel = pWInfo->pSelect;
+  if( (pSel->selFlags & SF_Aggregate)==0 ) return 0;
+  if( pSel->pGroupBy ) return 0;
+  if( pSel->pHaving ) return 0;
+  if( (pSel->selFlags & SF_Distinct)!=0 ) return 0;
+  if( pSel->pWin ) return 0;
+  if( pWInfo->pOrderBy ) return 0;  
+  if( pWInfo->nLevel!=1 ) return 0;
+  pTab = pWInfo->pTabList->a[0].pSTab;
+
+  if( pSel->pOrderBy ){
+    for(i=0; i<pSel->pOrderBy->nExpr; i++){
+      if( pSel->pOrderBy->a[i].pExpr->op==TK_AGG_FUNCTION ) return 0;
+    }
+  }
+  memset(&w, 0, sizeof(w));
+  w.pTab = pTab;
+  w.iCursor = pWInfo->pTabList->a[0].iCursor;
+  w.pSpec = pSpec;
+  w.nMax = nMax;
+  for(i=0; i<pSel->pEList->nExpr && !w.bFail; i++){
+    gpuAggWalkExpr(&w, pSel->pEList->a[i].pExpr);
+  }
+  if( w.bFail || w.n<=0 || w.n>nMax ) return 0;
+  return w.n;
+}
 #endif
 /*
 ** If an error occurs, this routine returns NULL.
@@ -7587,11 +7727,25 @@ void sqlite3WhereEnd(WhereInfo *pWInfo){
                 pIter->isAggregateOnly = 1;
               }
             }
+
+            if( !pIter->isAggregateOnly ){
+              GpuAggSpec aSpec[GPU_AGG_SPEC_MAX];
+              int nSpec, iSpec;
+              nSpec = sqlite3IsGpuAggEligible(pWInfo, aSpec, GPU_AGG_SPEC_MAX);
+              if( nSpec>0 ){
+                pIter->isAggValue = 1;
+                pIter->nAggs = nSpec;
+                for(iSpec=0; iSpec<nSpec; iSpec++){
+                  pIter->aggType[iSpec] = aSpec[iSpec].type;
+                  pIter->aggCol[iSpec] = aSpec[iSpec].columnIndex;
+                }
+              }
+            }
             pWInfo->pGpuCtx = NULL;  
 
             {
               int iLimitReg = -1;
-              if( !pIter->isAggregateOnly
+              if( !pIter->isAggregateOnly && !pIter->isAggValue
                && pWInfo->pSelect
                && pWInfo->pSelect->iLimit>0
                && pWInfo->pSelect->iOffset==0
@@ -7939,6 +8093,7 @@ typedef struct GpuWhereContext GpuWhereContext;
 extern GpuWhereContext* gpuWhereContextCreate(int maxRows, int numColumns);
 extern void gpuWhereContextDestroy(GpuWhereContext* ctx);
 extern int gpuWhereContextSetData(GpuWhereContext* ctx, const long long* data, int numRows);
+extern int gpuWhereContextSetNullMask(GpuWhereContext* ctx, const unsigned char* nullMask);
 extern int gpuWhereContextAddCondition(GpuWhereContext* ctx, const GpuCondition* cond);
 extern int gpuWhereContextSetRootCondition(GpuWhereContext* ctx, int rootIndex);
 extern int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* outputRows);
@@ -7946,29 +8101,38 @@ extern int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows);
 extern int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* outputRows);
 
 
-static int extractWhereConditions(WhereInfo *pWInfo, GpuCondition *conditions, int maxCond) {
+static int extractWhereConditions(WhereInfo *pWInfo, GpuCondition *conditions,
+                                  int maxCond, int *pbFull) {
   WhereClause *pWC = &pWInfo->sWC;
   int nCond = 0;
   int i;
-  
-  for(i = 0; i < pWC->nTerm && nCond < maxCond; i++) {
+  if( pbFull ) *pbFull = 1;
+
+  for(i = 0; i < pWC->nTerm; i++) {
     WhereTerm *pTerm = &pWC->a[i];
-    
+    GpuCondition *cond;
+
     if( (pTerm->wtFlags & (TERM_CODED|TERM_VIRTUAL))!=0 ) continue;
-    if( pTerm->eOperator == 0 ) continue;
-    
-    GpuCondition *cond = &conditions[nCond];
+    if( pTerm->eOperator == 0 ){ if( pbFull ) *pbFull = 0; continue; }
+
+    if( nCond >= maxCond ){ if( pbFull ) *pbFull = 0; continue; }
+
+    cond = &conditions[nCond];
     memset(cond, 0, sizeof(GpuCondition));
     cond->leftChild = -1;
     cond->rightChild = -1;
 
-    if( pTerm->eOperator & WO_EQ ) cond->opCode = 0;        /* = */
-    else if( pTerm->eOperator & WO_LT ) cond->opCode = 2;   /* < */
-    else if( pTerm->eOperator & WO_LE ) cond->opCode = 3;   /* <= */
-    else if( pTerm->eOperator & WO_GT ) cond->opCode = 4;   /* > */
-    else if( pTerm->eOperator & WO_GE ) cond->opCode = 5;   /* >= */
-    else continue;
-    
+
+    {
+      int cmpBits = pTerm->eOperator & (WO_EQ|WO_LT|WO_LE|WO_GT|WO_GE);
+      if( cmpBits & (cmpBits-1) ){ if( pbFull ) *pbFull = 0; continue; }
+    }
+    if( pTerm->eOperator & WO_EQ ) cond->opCode = 0;        //=
+    else if( pTerm->eOperator & WO_LT ) cond->opCode = 2;   //<
+    else if( pTerm->eOperator & WO_LE ) cond->opCode = 3;   //<=
+    else if( pTerm->eOperator & WO_GT ) cond->opCode = 4;   //>
+    else if( pTerm->eOperator & WO_GE ) cond->opCode = 5;   //>=
+    else { if( pbFull ) *pbFull = 0; continue; }
 
     {
       Table *pTab = pWInfo->pTabList->a[0].pSTab;
@@ -7977,7 +8141,7 @@ static int extractWhereConditions(WhereInfo *pWInfo, GpuCondition *conditions, i
       if( iPKey >= 0 && leftCol == iPKey ){
         cond->columnIndex = 0;  //IPK mapps to rowid, so we use columnIndex 0 for it
       }else{
-        cond->columnIndex = leftCol + 1;  
+        cond->columnIndex = leftCol + 1;
       }
     }
 
@@ -7997,10 +8161,14 @@ static int extractWhereConditions(WhereInfo *pWInfo, GpuCondition *conditions, i
         sqlite3Atoi64(pRight->u.zToken, &tmpVal, SQLITE_UTF8, SQLITE_UTF8);
         cond->value1 = tmpVal;
         nCond++;
+      }else{
+        if( pbFull ) *pbFull = 0;
       }
+    }else{
+      if( pbFull ) *pbFull = 0;
     }
   }
-  
+
   return nCond;
 }
 
@@ -8008,6 +8176,7 @@ static int extractWhereConditions(WhereInfo *pWInfo, GpuCondition *conditions, i
 SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
   int i;
   int nConditions;
+  int bWhereFull;
   int nColumns;
   GpuCondition conditions[32];
   Table *pTab;
@@ -8019,8 +8188,11 @@ SQLITE_PRIVATE int sqlite3WhereInitGpuScan(WhereInfo *pWInfo){
   pWInfo->nGpuRowids = 0;
   pWInfo->pGpuCtx = NULL;
 
-  nConditions = extractWhereConditions(pWInfo, conditions, 32);
+  nConditions = extractWhereConditions(pWInfo, conditions, 32, &bWhereFull);
   if( nConditions == 0 ) return 0;
+
+
+  if( !bWhereFull ) return 0;
 
   pTab = pWInfo->pTabList->a[0].pSTab;
   nColumns = pTab->nCol + 1;  

@@ -1930,6 +1930,24 @@ static void sumStep(sqlite3_context *context, int argc, sqlite3_value **argv){
   assert( argc==1 );
   UNUSED_PARAMETER(argc);
   p = sqlite3_aggregate_context(context, sizeof(*p));
+#ifdef SQLITE_ENABLE_GPU_SCAN
+  if( p ){
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    if( db->gpuAggActive && db->gpuAggInject ){
+      //case 2: isAggValue : GPU-injected SUM/AVG term.  isNull means cnt==0 (no non-NULL inputs) so leave the context zero-inited to make sum/avgFinalize return NULL.
+      GpuAggInject *pInj = db->gpuAggInject;
+      if( pInj->isNull==0 ){
+        p->cnt = pInj->rowCount;
+        p->iSum = pInj->value;
+        p->approx = 0;
+        p->ovrfl = 0;
+      }
+      db->gpuAggInject = pInj->next;
+      sqlite3DbFree(db, pInj);
+      return;
+    }
+  }
+#endif
   type = sqlite3_value_numeric_type(argv[0]);
   if( p && type!=SQLITE_NULL ){
     p->cnt++;
@@ -2057,21 +2075,32 @@ struct CountCtx {
 static void countStep(sqlite3_context *context, int argc, sqlite3_value **argv){
   CountCtx *p;
   p = sqlite3_aggregate_context(context, sizeof(*p));
-  if( (argc==0 || SQLITE_NULL!=sqlite3_value_type(argv[0])) && p ){
+  if( p==0 ) return;
 #ifdef SQLITE_ENABLE_GPU_SCAN
-    {
-      sqlite3 *db = sqlite3_context_db_handle(context);
-      if( db->gpuAggActive ){
+  {
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    if( db->gpuAggActive ){
+      if( db->gpuAggInject ){
+
+        //case 2: isAggValue : GPU-injected COUNT term.The single served row may itself carry a NULL arg, 
+        // so the argc/NULL gate below must NOT swallow the injected count.
+        GpuAggInject *pInj = db->gpuAggInject;
+        p->n = pInj->rowCount;
+        db->gpuAggInject = pInj->next;
+        sqlite3DbFree(db, pInj);
+      }else if( argc==0 || SQLITE_NULL!=sqlite3_value_type(argv[0]) ){
+        /* Case 1 (isAggregateOnly): pure count(*) fast path. */
         p->n = db->gpuAggCount;
-        db->gpuAggActive = 0;
-      }else{
-        p->n++;
       }
+    }else if( argc==0 || SQLITE_NULL!=sqlite3_value_type(argv[0]) ){
+      p->n++;
     }
-#else
-    p->n++;
-#endif
   }
+#else
+  if( argc==0 || SQLITE_NULL!=sqlite3_value_type(argv[0]) ){
+    p->n++;
+  }
+#endif
 
 #ifndef SQLITE_OMIT_DEPRECATED
   /* The sqlite3_aggregate_count() function is deprecated.  But just to make
@@ -2117,6 +2146,24 @@ static void minmaxStep(
 
   pBest = (Mem *)sqlite3_aggregate_context(context, sizeof(*pBest));
   if( !pBest ) return;
+
+#ifdef SQLITE_ENABLE_GPU_SCAN
+  {
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    if( db->gpuAggActive && db->gpuAggInject ){
+
+     //case 2: isAggValue : GPU-injected MIN/MAX term.  isNull means cnt==0 (no non-NULL inputs) so leave the context zero-inited to make min/maxFinalize return NULL.
+      GpuAggInject *pInj = db->gpuAggInject;
+      if( pInj->isNull==0 ){
+        pBest->db = db;
+        sqlite3VdbeMemSetInt64(pBest, pInj->value);
+      }
+      db->gpuAggInject = pInj->next;
+      sqlite3DbFree(db, pInj);
+      return;
+    }
+  }
+#endif
 
   if( sqlite3_value_type(pArg)==SQLITE_NULL ){
     if( pBest->flags ) sqlite3SkipAccumulatorLoad(context);

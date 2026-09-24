@@ -9192,17 +9192,50 @@ case OP_GpuScan: {
         //this basically overlaps btree read(cpu bound) with gpu kernel hiding the time latency
         long long *tableDataA = tableData;
         long long *tableDataB = NULL;
-        if( pIter->isAggregateOnly ){
+        unsigned char *nullMaskA = NULL;
+        unsigned char *nullMaskB = NULL;
+        unsigned char *curMask = NULL;
+        unsigned char *nxtMask = NULL;
+        u64 pAggColBits = 0;
+        if( pIter->isAggregateOnly || pIter->isAggValue ){
           tableDataB = (long long*)sqlite3DbMallocRaw(db,
               (u64)GPU_BATCH_SIZE * (u64)nColumns * sizeof(long long));
         }
+        {
+
+          u64 nullBytes = ((u64)GPU_BATCH_SIZE * (u64)nColumns + 7) / 8;
+          nullMaskA = (unsigned char*)sqlite3DbMallocRaw(db, nullBytes);
+          if( pIter->isAggregateOnly || pIter->isAggValue ){
+            nullMaskB = (unsigned char*)sqlite3DbMallocRaw(db, nullBytes);
+          }
+        }
         long long *curBuf = tableDataA;
-        long long *nxtBuf = pIter->isAggregateOnly ? tableDataB : NULL;
-        int hasPending = 0;     
+        long long *nxtBuf = (pIter->isAggregateOnly || pIter->isAggValue) ? tableDataB : NULL;
+        int hasPending = 0;
+        int aggMixedLocal = 0;
+        int anyNullBatch = 0;
+        curMask = nullMaskA;
+        nxtMask = (pIter->isAggregateOnly || pIter->isAggValue) ? nullMaskB : NULL;
+       //figure out which columns are used in aggregate terms, so we can skip decoding other columns
+        {
+          u64 aggColBits = 0;
+          int t;
+          for(t=0; t<pIter->nAggs; t++){
+            if( pIter->aggCol[t]>=0 && pIter->aggCol[t]<64 ){
+              aggColBits |= ((u64)1) << pIter->aggCol[t];
+            }
+          }
+          pAggColBits = aggColBits;
+        }     
         
         while( rc2 == SQLITE_OK && scanRes == 0
                && (iLimitShort<0 || totalRows < iLimitShort) ){
+
+         //ping pong buffer are reused across batches, so stale NULL from prev batch should not leak in 
+         //One memset per batch is far cheaper than clearing every cell in the inner decode loop below
+          if( curMask ) memset(curMask, 0, ((u64)GPU_BATCH_SIZE * (u64)nColumns + 7) / 8);
           actualRows = 0;
+          anyNullBatch = 0;
           while( rc2 == SQLITE_OK && scanRes == 0
                  && actualRows < GPU_BATCH_SIZE ){
             i64 curRowid;
@@ -9235,6 +9268,11 @@ case OP_GpuScan: {
                   
                   if( serial_type == 0 ){
                     value = 0;
+                    if( curMask ){
+                      unsigned int cbit = (unsigned int)actualRows * (unsigned int)nColumns + (unsigned int)col;
+                      curMask[cbit >> 3] |= (unsigned char)(1 << (cbit & 7));
+                    }
+                    anyNullBatch = 1;
                   } else if( serial_type == 1 ){
                     value = (signed char)aPayload[offset];
                     offset += 1;
@@ -9267,15 +9305,27 @@ case OP_GpuScan: {
                   } else if( serial_type == 9 ){
                     value = 1;
                   } else {
+                    // nonint serial: 7 real, 10/11 is null, 12+ is text/blob
                     len = sqlite3VdbeSerialTypeLen(serial_type);
                     offset += len;
                     value = 0;
+                    if( curMask && (serial_type==10 || serial_type==11) ){
+                      unsigned int cbit = (unsigned int)actualRows * (unsigned int)nColumns + (unsigned int)col;
+                      curMask[cbit >> 3] |= (unsigned char)(1 << (cbit & 7));
+                      anyNullBatch = 1;
+                    }
+                    if( ((pAggColBits >> col) & 1) ) aggMixedLocal = 1;
                   }
                   
                   curBuf[actualRows * nColumns + col] = value;
                 }
                 while( col < nColumns ){
                   curBuf[actualRows * nColumns + col] = 0;
+                  if( curMask ){
+                    unsigned int cbit = (unsigned int)actualRows * (unsigned int)nColumns + (unsigned int)col;
+                    curMask[cbit >> 3] |= (unsigned char)(1 << (cbit & 7));
+                    anyNullBatch = 1;
+                  }
                   col++;
                 }
                 actualRows++;
@@ -9284,6 +9334,7 @@ case OP_GpuScan: {
             rc2 = sqlite3BtreeNext(pBtCur, 0);
           }
           
+          if( aggMixedLocal && !pIter->aggMixed ) pIter->aggMixed = 1;
           if( actualRows > 0 ){
             if( pIter->isAggregateOnly ){
               if( aggFirstRowid < 0 ){
@@ -9291,6 +9342,7 @@ case OP_GpuScan: {
                 long long *batchRowids = NULL;
                 int batchCount = 0;
                 gpuWhereContextSetData(gpuCtx, curBuf, actualRows);
+                gpuWhereContextSetNullMask(gpuCtx, anyNullBatch ? curMask : NULL);
                 if( gpuWhereContextRowids(gpuCtx, &batchRowids, &batchCount)==0 ){
                   pIter->aggregateCount += batchCount;
                   if( batchCount > 0 ){
@@ -9306,6 +9358,7 @@ case OP_GpuScan: {
                   hasPending = 0;
                 }
 
+                gpuWhereContextSetNullMask(gpuCtx, anyNullBatch ? curMask : NULL);
                 if( gpuWhereContextSubmitCount(gpuCtx, curBuf, actualRows)==0 ){
                   hasPending = 1;
                 }else{
@@ -9315,10 +9368,108 @@ case OP_GpuScan: {
                   }
                 }
               }
+            }else if( pIter->isAggValue ){
+              long long *batchRows = NULL;
+              int batchCount = 0;
+              GpuAggPartial aggOut[GPU_MAX_AGGREGATES_PER_QUERY];
+              GpuAggSpec aggSpecs[GPU_MAX_AGGREGATES_PER_QUERY];
+              int aggRc;
+              int ai;
+              for(ai=0; ai<pIter->nAggs; ai++){
+                aggSpecs[ai].type = pIter->aggType[ai];
+                aggSpecs[ai].columnIndex = pIter->aggCol[ai];
+              }
+              if( gpuWhereContextSetData(gpuCtx, curBuf, actualRows)!=0 ){
+                batchCount = 0;
+                batchRows = NULL;
+                aggRc = -1;
+              }else{
+                aggRc = gpuWhereContextAggExecute(gpuCtx,
+                    curMask, &batchRows, &batchCount,
+                    aggOut, aggSpecs, pIter->nAggs, 1);
+                if( aggRc!=0 ){
+                  batchCount = 0;
+                  batchRows = NULL;
+                }else if( batchRows==0 ){ batchCount = 0; }
+              }
+              if( aggRc==0 ){
+                for(ai=0; ai<pIter->nAggs; ai++){
+                  u64 lo = (u64)pIter->aggTotals[ai].sumLo;
+                  u64 hi = (u64)pIter->aggTotals[ai].sumHi;
+                  u64 alo = aggOut[ai].sumLo;
+                  u64 ahi = aggOut[ai].sumHi;
+                  u64 carry;
+                  lo += alo;
+                  carry = lo < alo ? 1 : 0;
+                  hi += ahi + carry;
+                  pIter->aggTotals[ai].sumLo = (unsigned long long)lo;
+                  pIter->aggTotals[ai].sumHi = (unsigned long long)hi;
+                  if( pIter->aggTotals[ai].hasAny==0 ){
+                    pIter->aggTotals[ai].minVal = aggOut[ai].minVal;
+                    pIter->aggTotals[ai].maxVal = aggOut[ai].maxVal;
+                  }else{
+                    if( aggOut[ai].hasAny ){
+                      if( aggOut[ai].minVal < pIter->aggTotals[ai].minVal )
+                        pIter->aggTotals[ai].minVal = aggOut[ai].minVal;
+                      if( aggOut[ai].maxVal > pIter->aggTotals[ai].maxVal )
+                        pIter->aggTotals[ai].maxVal = aggOut[ai].maxVal;
+                    }
+                  }
+                  pIter->aggTotals[ai].cnt += aggOut[ai].cnt;
+                  if( aggOut[ai].hasAny ) pIter->aggTotals[ai].hasAny = 1;
+                }
+                batchRows = (long long*)(batchCount>0 ? batchRows : NULL);
+              }else{
+                batchCount = 0;
+                batchRows = NULL;
+              }
+              if( batchCount > 0 ){
+                if( aggFirstRowid < 0 ) aggFirstRowid = batchRows[0];
+                {
+                  int nRemain = batchCount;
+                  long long *src = batchRows;
+                  while( nRemain > 0 ){
+                    int room = segRows - segFill;
+                    int nTake = nRemain < room ? nRemain : room;
+                    long long *seg;
+                    if( segCount == segCapacity ){
+                      int newCap = segCapacity ? segCapacity * 2 : 16;
+                      long long **tmp;
+                      tmp = (long long**)sqlite3DbMallocRaw(db,
+                          (u64)newCap * sizeof(long long*));
+                      if( !tmp ) goto gpuScanCollectOom;
+                      if( allSegs ){
+                        memcpy(tmp, allSegs,
+                               (u64)segCount * sizeof(long long*));
+                        sqlite3DbFree(db, allSegs);
+                      }
+                      allSegs = tmp;
+                      segCapacity = newCap;
+                    }
+                    if( segFill == 0 ){
+                      seg = (long long*)sqlite3DbMallocRaw(db,
+                          (u64)segRows * (u64)nColumns * sizeof(long long));
+                      if( !seg ) goto gpuScanCollectOom;
+                      allSegs[segCount++] = seg;
+                    }
+                    seg = allSegs[segCount-1];
+                    memcpy(seg + (sqlite3_int64)segFill * nColumns, src,
+                           (u64)nTake * (u64)nColumns * sizeof(long long));
+                    segFill += nTake;
+                    src += (sqlite3_int64)nTake * nColumns;
+                    nRemain -= nTake;
+                    if( segFill >= segRows ) segFill = 0;
+                  }
+                  totalRows += batchCount;
+                }
+              }
             }else{
               long long *batchRows = NULL;
               int batchCount = 0;
               int setDataRc = gpuWhereContextSetData(gpuCtx, curBuf, actualRows);
+              if( setDataRc == 0 ){
+                gpuWhereContextSetNullMask(gpuCtx, anyNullBatch ? curMask : NULL);
+              }
               if( setDataRc == 0
                && gpuWhereContextExecute(gpuCtx, &batchRows, &batchCount)==0
                && batchCount > 0 ){
@@ -9368,10 +9519,15 @@ case OP_GpuScan: {
         }
           
 
-          if( pIter->isAggregateOnly && nxtBuf ){
+          if( (pIter->isAggregateOnly || pIter->isAggValue) && nxtBuf ){
             long long *tmp = curBuf;
             curBuf = nxtBuf;
             nxtBuf = tmp;
+            if( curMask && nxtMask ){
+              unsigned char *tmpm = curMask;
+              curMask = nxtMask;
+              nxtMask = tmpm;
+            }
           }
         
         if( hasPending ){
@@ -9384,6 +9540,12 @@ case OP_GpuScan: {
         if( tableDataB ){
           sqlite3DbFree(db, tableDataB);
         }
+        if( nullMaskA ){
+          sqlite3DbFree(db, nullMaskA);
+        }
+        if( nullMaskB ){
+          sqlite3DbFree(db, nullMaskB);
+        }
         sqlite3BtreeCloseCursor(pBtCur);
       }else{
         sqlite3DbFreeNN(db, pBtCur);
@@ -9394,18 +9556,103 @@ case OP_GpuScan: {
     gpuWhereContextDestroy(gpuCtx);
     pIter->pGpuCtx = NULL;
 
+    if( pIter->isAggValue ){
+
+     //case 2, to check if the GPU computed SUM/AVG overflows 64-bit signed integer, if so, we need to fallback to CPU aggregation to get the 
+     // exact error message and byte identical match with CPU aggregation
+      int bOverflow = 0;
+      int ai;
+      for(ai=0; ai<pIter->nAggs; ai++){
+        u64 hi;
+        u64 lo;
+        int tp = pIter->aggType[ai];
+        if( tp!=GPU_AGG_SUM && tp!=GPU_AGG_AVG ) continue;
+        hi = (u64)pIter->aggTotals[ai].sumHi;
+        lo = (u64)pIter->aggTotals[ai].sumLo;
+        if( !((hi==0 && (lo>>63)==0) || (hi==0xFFFFFFFFFFFFFFFFULL && (lo>>63)!=0)) ){
+          bOverflow = 1;
+          break;
+        }
+      }
+      if( !pIter->aggMixed && !bOverflow
+       && totalRows>0 && allSegs && segCount>0 && aggFirstRowid>=0
+      ){
+
+        rc2 = sqlite3BtreeTableMoveto(pC->uc.pCursor, aggFirstRowid, 0, &res);
+        if( rc2!=SQLITE_OK ) res = 1;
+        if( res==0 ){
+          GpuAggInject *pHead = 0;
+          GpuAggInject **ppTail = &pHead;
+          for(ai=0; ai<pIter->nAggs; ai++){
+            GpuAggPartial *pT = &pIter->aggTotals[ai];
+            GpuAggInject *pInj =
+                (GpuAggInject*)sqlite3DbMallocZero(db, sizeof(GpuAggInject));
+            if( pInj==0 ){
+              GpuAggInject *pFree = pHead;
+              while( pFree ){
+                GpuAggInject *pN = pFree->next;
+                sqlite3DbFree(db, pFree);
+                pFree = pN;
+              }
+              goto gpuScanDeferredDoneAggFallback;
+            }
+            pInj->type = pIter->aggType[ai];
+            pInj->columnIndex = pIter->aggCol[ai];
+            pInj->rowCount = pT->cnt;
+            if( pIter->aggType[ai]==GPU_AGG_COUNT_STAR
+             || pIter->aggType[ai]==GPU_AGG_COUNT_COL ){
+              pInj->value = 0;
+              pInj->isNull = 0;
+            }else if( pIter->aggType[ai]==GPU_AGG_MIN ){
+              pInj->value = pT->hasAny ? (long long)pT->minVal : 0;
+              pInj->isNull = pT->hasAny ? 0 : 1;
+            }else if( pIter->aggType[ai]==GPU_AGG_MAX ){
+              pInj->value = pT->hasAny ? (long long)pT->maxVal : 0;
+              pInj->isNull = pT->hasAny ? 0 : 1;
+            }else{   
+              pInj->value = (long long)pT->sumLo;
+              pInj->isNull = (pT->cnt==0) ? 1 : 0;
+            }
+            *ppTail = pInj;
+            ppTail = &pInj->next;
+          }
+          db->gpuAggInject = pHead;
+          db->gpuAggActive = 1;
+          pC->nullRow = 0;
+          pC->deferredMoveto = 0;
+          pC->gpuRow = 0;
+          pC->movetoTarget = aggFirstRowid;
+          pC->cacheStatus = CACHE_STALE;
+          pIter->aggSingleServe = 1;
+          pIter->count = 1;
+          pIter->idx = 0;
+          pIter->rowids = NULL;
+          if( allSegs ){
+            int k;
+            for( k=0; k<segCount; k++ ){
+              sqlite3DbFree(db, allSegs[k]);
+            }
+            sqlite3DbFree(db, allSegs);
+            allSegs = NULL;
+            segCount = 0;
+          }
+          goto gpuScanNext;
+        }
+      }
+    gpuScanDeferredDoneAggFallback:
+
+      if( totalRows<=0 || allSegs==0 || segCount<=0 ){
+        pIter->count = 0;
+        pIter->idx = 0;
+        pIter->rowids = NULL;
+        pIter->aggSingleServe = 0;
+        goto gpuScanNext;
+      }
+    }
+
     if( pIter->isAggregateOnly ){
       if( pIter->aggregateCount > 0 && aggFirstRowid >= 0 ){
-        /* Aggregate shortcut: inject GPU count directly.
-        ** 1. Store the GPU count in db->gpuAggCount
-        ** 2. Set db->gpuAggActive = 1 so countStep uses it
-        ** 3. Position cursor at a matching row
-        ** 4. Set count=1 so the loop body runs exactly ONCE
-        **    (Column reads value, Le passes, AggStep calls countStep
-        **     which sees gpuAggActive and sets p->n = gpuAggCount)
-        ** 5. After that one iteration, GpuScan fires again, sees
-        **    idx>=count, and exits the loop.
-        ** This replaces N Btree seeks + N VDBE iterations with just 1. */
+
        
         rc2 = sqlite3BtreeTableMoveto(pC->uc.pCursor,
                                        aggFirstRowid, 0, &res);
@@ -9445,7 +9692,7 @@ case OP_GpuScan: {
           pNewIter->count = (u32)iLimitShort;
         }
         pNewIter->idx = 0;
-        if( !pC->nullRow && pC->uc.pCursor
+        if( !pIter->isAggValue && !pC->nullRow && pC->uc.pCursor
          && pNewIter->rowsSeg[0] != 0
          && pNewIter->rowsSeg[0][0] == sqlite3BtreeIntegerKey(pC->uc.pCursor) ){
           pNewIter->idx = 1;
@@ -9509,11 +9756,26 @@ gpuScanNext:
 #ifdef SQLITE_ENABLE_GPU_SCAN
     pC->gpuRow = 0;
     p->db->gpuAggActive = 0;
+    {
+      GpuAggInject *pFree = p->db->gpuAggInject;
+      while( pFree ){
+        GpuAggInject *pN = pFree->next;
+        sqlite3DbFree(p->db, pFree);
+        pFree = pN;
+      }
+      p->db->gpuAggInject = NULL;
+    }
 #endif
     goto check_for_interrupt;
   }
-  if( pIter->isAggregateOnly ){
+  if( pIter->isAggregateOnly || pIter->aggSingleServe ){
+    if( pIter->aggSingleServe ){
 
+      if( pC->deferredMoveto ){
+        int irc2 = sqlite3VdbeFinishMoveto(pC);
+        if( irc2 ) goto abort_due_to_error;
+      }
+    }
     pIter->idx++;
     pC->nullRow = 0;
     goto jump_to_p2_and_check_for_interrupt;
@@ -9523,6 +9785,25 @@ gpuScanNext:
     sqlite3_int64 rowIndex = pIter->idx;
     sqlite3_int64 segIdx = rowIndex / (sqlite3_int64)pIter->segCap;
     sqlite3_int64 segOff = rowIndex % (sqlite3_int64)pIter->segCap;
+    if( pIter->isAggValue ){
+
+      i64 rowid = pIter->rowsSeg[segIdx][segOff * pIter->nColumns];
+      pIter->idx++;
+      pC->gpuRow = 0;
+      res = 0;
+      rc = sqlite3BtreeTableMoveto(pC->uc.pCursor, rowid, 0, &res);
+      if( rc ) goto abort_due_to_error;
+      if( res!=0 ) goto gpuScanNext;
+      pC->nullRow = 0;
+      pC->deferredMoveto = 0;
+      pC->movetoTarget = rowid;
+      pC->cacheStatus = CACHE_STALE;
+      p->aCounter[pOp->p5]++;
+#ifdef SQLITE_TEST
+      sqlite3_search_count++;
+#endif
+      goto jump_to_p2_and_check_for_interrupt;
+    }
     pC->gpuRow = &pIter->rowsSeg[segIdx][segOff * pIter->nColumns];
     pC->gpuRowWidth = (u32)pIter->nColumns;
     pIter->idx++;

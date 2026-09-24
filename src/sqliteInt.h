@@ -1656,6 +1656,42 @@ typedef int (*sqlite3_xauth)(void*,int,const char*,const char*,const char*,
 */
 #define SQLITE_MAX_DB (SQLITE_MAX_ATTACHED+2)
 
+#ifdef SQLITE_ENABLE_GPU_SCAN
+//These constants match the GpuAggSpec.type enum in gpu_manager.h
+#define GPU_AGG_COUNT_STAR 0   
+#define GPU_AGG_COUNT_COL  1   
+#define GPU_AGG_SUM        2   
+#define GPU_AGG_AVG        3   
+#define GPU_AGG_MIN        4   
+#define GPU_AGG_MAX        5   
+
+
+typedef struct GpuAggSpec {
+  int type;             
+  int columnIndex;      
+} GpuAggSpec;
+
+
+typedef struct GpuAggPartial {
+  unsigned long long sumLo;  
+  unsigned long long sumHi;  
+  long long minVal;          
+  long long maxVal;          
+  long long cnt;             
+  unsigned int hasAny;       
+} GpuAggPartial;
+
+
+typedef struct GpuAggInject {
+  int type;                  
+  int columnIndex;           
+  long long value;           
+  long long rowCount;        
+  unsigned char isNull;      
+  struct GpuAggInject *next; 
+} GpuAggInject;
+#endif /* SQLITE_ENABLE_GPU_SCAN */
+
 /*
 ** Each database connection is an instance of the following structure.
 */
@@ -1805,6 +1841,7 @@ struct sqlite3 {
 #ifdef SQLITE_ENABLE_GPU_SCAN
   i64 gpuAggCount;              //count computed by GPU for aggregate short path
   u8 gpuAggActive;              //just a flag to indicate if GPU agg can be used
+  struct GpuAggInject *gpuAggInject; /* FIFO of GPU-computed aggregate terms */
 #endif
 };
 

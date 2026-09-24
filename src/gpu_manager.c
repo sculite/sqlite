@@ -13,7 +13,8 @@ extern int gpuWhereClause(
     int numRows,
     int numColumns,
     int numConditions,
-    int rootConditionIndex
+    int rootConditionIndex,
+    const unsigned char* h_nullMask
 );
 extern int gpuWhereClauseCount(
     const long long* h_data,
@@ -22,7 +23,8 @@ extern int gpuWhereClauseCount(
     int numRows,
     int numColumns,
     int numConditions,
-    int rootConditionIndex
+    int rootConditionIndex,
+    const unsigned char* h_nullMask
 );
 extern int gpuWhereClauseRowids(
     const long long* h_data,
@@ -32,7 +34,8 @@ extern int gpuWhereClauseRowids(
     int numRows,
     int numColumns,
     int numConditions,
-    int rootConditionIndex
+    int rootConditionIndex,
+    const unsigned char* h_nullMask
 );
 extern int gpuWhereClauseCountSubmit(
     const long long* h_data,
@@ -40,9 +43,25 @@ extern int gpuWhereClauseCountSubmit(
     int numRows,
     int numColumns,
     int numConditions,
-    int rootConditionIndex
+    int rootConditionIndex,
+    const unsigned char* h_nullMask
 );
 extern int gpuWhereClauseCountCollect(int* h_outputCount);
+extern int gpuWhereClauseAgg(
+    const long long* h_data,
+    const unsigned char* h_nullMask,
+    long long* h_output,
+    int* h_outputCount,
+    const GpuCondition* h_conditions,
+    GpuAggPartial* h_aggOut,
+    const GpuAggSpec* h_aggSpecs,
+    int numAggs,
+    int numRows,
+    int numColumns,
+    int numConditions,
+    int rootConditionIndex,
+    int wantRows
+);
 
 static int g_gpuInitialized = 0;
 static int g_gpuAvailable = 0;
@@ -159,6 +178,12 @@ int gpuWhereContextSetData(GpuWhereContext* ctx, const long long* data, int numR
     return 0;
 }
 
+int gpuWhereContextSetNullMask(GpuWhereContext* ctx, const unsigned char* nullMask) {
+    if(!ctx) return -1;
+    ctx->nullMask = nullMask;
+    return 0;
+}
+
 int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* outputRows) {
     if(!ctx || !outputData || !outputRows) return -1;
     if(ctx->numRows <= 0) return -1;
@@ -172,7 +197,8 @@ int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* ou
         ctx->numRows,
         ctx->numColumns,
         ctx->numConditions,
-        ctx->rootConditionIndex
+        ctx->rootConditionIndex,
+        ctx->nullMask
     );
     
     if(result != 0) {
@@ -195,7 +221,8 @@ int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows) {
         ctx->numRows,
         ctx->numColumns,
         ctx->numConditions,
-        ctx->rootConditionIndex
+        ctx->rootConditionIndex,
+        ctx->nullMask
     );
 }
 
@@ -220,7 +247,8 @@ int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* o
         ctx->numRows,
         ctx->numColumns,
         ctx->numConditions,
-        ctx->rootConditionIndex
+        ctx->rootConditionIndex,
+        ctx->nullMask
     );
 
     if(result != 0) return -1;
@@ -239,11 +267,49 @@ int gpuWhereContextSubmitCount(GpuWhereContext* ctx, const long long* data, int 
         numRows,
         ctx->numColumns,
         ctx->numConditions,
-        ctx->rootConditionIndex
+        ctx->rootConditionIndex,
+        ctx->nullMask
     );
 }
 
 int gpuWhereContextCollectCount(int* outputRows) {
     return gpuWhereClauseCountCollect(outputRows);
+}
+
+int gpuWhereContextAggExecute(
+    GpuWhereContext* ctx,
+    const unsigned char* h_nullMask,
+    long long** outputData,
+    int* outputRows,
+    GpuAggPartial* h_aggOut,
+    const GpuAggSpec* aggSpecs,
+    int numAggs,
+    int wantRows
+) {
+    if(!ctx || !aggSpecs || !h_aggOut || numAggs <= 0) return -1;
+    if(ctx->numRows <= 0) return -1;
+
+    int resultCount = 0;
+    int result = gpuWhereClauseAgg(
+        ctx->dataBuffer,
+        h_nullMask,
+        wantRows ? ctx->outputBuffer : NULL,
+        &resultCount,
+        ctx->conditions,
+        h_aggOut,
+        aggSpecs,
+        numAggs,
+        ctx->numRows,
+        ctx->numColumns,
+        ctx->numConditions,
+        ctx->rootConditionIndex,
+        wantRows
+    );
+
+    if(result != 0) return -1;
+
+    if(outputData) *outputData = ctx->outputBuffer;
+    if(outputRows) *outputRows = resultCount;
+    return 0;
 }
 //Yes no comments, I cant

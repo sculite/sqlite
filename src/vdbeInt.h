@@ -766,18 +766,40 @@ typedef struct GpuRowidIter {
   int iRootPage;    
   int isAggregateOnly;  
   int aggregateCount;   
+  int isAggValue;       
+  int aggSingleServe;   
+  int nAggs;            
+  int aggType[8];       
+  int aggCol[8];        
+  GpuAggPartial aggTotals[8]; 
+  int aggMixed;        
+                        
+  long long aggFirstRowid; 
 } GpuRowidIter;
 
 typedef struct GpuWhereContext GpuWhereContext;
 typedef struct GpuCondition GpuCondition;
+typedef struct GpuAggPartial GpuAggPartial;
+typedef struct GpuAggSpec GpuAggSpec;
 extern GpuWhereContext* gpuWhereContextCreate(int maxRows, int numColumns);
 extern void gpuWhereContextDestroy(GpuWhereContext* ctx);
 extern int gpuWhereContextAddCondition(GpuWhereContext* ctx, const GpuCondition* cond);
 extern int gpuWhereContextSetRootCondition(GpuWhereContext* ctx, int rootIndex);
 extern int gpuWhereContextSetData(GpuWhereContext* ctx, const long long* data, int numRows);
+extern int gpuWhereContextSetNullMask(GpuWhereContext* ctx, const unsigned char* nullMask);
 extern int gpuWhereContextExecute(GpuWhereContext* ctx, long long** outputData, int* outputRows);
 extern int gpuWhereContextRowids(GpuWhereContext* ctx, long long** outputRowids, int* outputRows);
 extern int gpuWhereContextCount(GpuWhereContext* ctx, int* outputRows);
+extern int gpuWhereContextAggExecute(
+    GpuWhereContext* ctx,
+    const unsigned char* h_nullMask,
+    long long** h_outputData,
+    int* h_outputRows,
+    GpuAggPartial* h_aggOut,
+    const GpuAggSpec* aggSpecs,
+    int numAggs,
+    int wantRows
+);
 #endif
 
 #endif /* !defined(SQLITE_VDBEINT_H) */
